@@ -1,3 +1,16 @@
+"""
+Run the first-order inverse-physics training for each case.
+
+Inputs
+------
+- Optimised parameters from ``experiments_optimization/<case>/optimal_params.pkl``.
+- Case data in ``data/different_types/<case>/`` including ``final_data.pkl``, calibration, metadata, and ``split.json``.
+
+Outputs
+-------
+- Training checkpoints, logs, and metrics written to ``experiments/<case>/``.
+"""
+
 import glob
 import os
 import json

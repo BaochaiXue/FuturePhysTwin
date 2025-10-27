@@ -1,3 +1,16 @@
+"""
+Generate per-camera human-mask videos used for render overlays.
+
+Inputs
+------
+- RGB sequences and supporting data in ``data/different_types/<case>/``.
+- Depth folders and mask metadata (``mask/mask_info_*.json``) per case.
+
+Outputs
+-------
+- Foreground human masks saved to ``data/different_types_human_mask/<case>/mask/<camera>/``.
+"""
+
 import os
 import glob
 
@@ -21,7 +34,20 @@ for dir_name in dir_names:
 
     for camera_idx in range(camera_num):
         print(f"Processing {case_name} camera {camera_idx}")
-        os.system(
-            f"python ./data_process/segment_util_video.py --output_path {output_path}/{case_name} --base_path {base_path} --case_name {case_name} --TEXT_PROMPT {TEXT_PROMPT} --camera_idx {camera_idx}"
+        cmd = (
+            f"python ./data_process/segment_util_video.py "
+            f"--output_path {output_path}/{case_name} "
+            f"--base_path {base_path} "
+            f"--case_name {case_name} "
+            f"--TEXT_PROMPT {TEXT_PROMPT} "
+            f"--camera_idx {camera_idx}"
         )
+        mask_info_path = f"{base_path}/{case_name}/mask/mask_info_{camera_idx}.json"
+        mask_root_path = f"{base_path}/{case_name}/mask/{camera_idx}"
+        if os.path.isfile(mask_info_path) and os.path.isdir(mask_root_path):
+            cmd += (
+                f" --exclude_mask_info {mask_info_path}"
+                f" --exclude_mask_root {mask_root_path}"
+            )
+        os.system(cmd)
         os.system(f"rm -rf {base_path}/{case_name}/tmp_data")

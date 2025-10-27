@@ -1,3 +1,19 @@
+"""
+Process raw multi-view captures into assets required by downstream stages.
+
+Inputs
+------
+- ``data_config.csv`` describing cases and categories.
+- Raw data in ``data/different_types/<case>/`` (RGB, depth, masks, calibrate.pkl, metadata.json, etc.).
+
+Outputs
+-------
+- Processed artefacts written back to ``data/different_types/<case>/``:
+  * Segmented masks, tracked trajectories, point clouds, optional shape priors.
+  * ``final_data.pkl`` bundles and ``split.json`` train/test metadata.
+  * Timing logs in ``timer.log``.
+"""
+
 import os
 import csv
 

@@ -1,3 +1,17 @@
+"""
+Perform model inference on each trained case.
+
+Inputs
+------
+- Trained checkpoints in ``experiments/<case>/``.
+- Supporting optimisation results in ``experiments_optimization/<case>/``.
+- Processed case data within ``data/different_types/<case>/``.
+
+Outputs
+-------
+- Inference artefacts (e.g. ``inference.pkl`` trajectories) saved inside ``experiments/<case>/``.
+"""
+
 import glob
 import os
 import json

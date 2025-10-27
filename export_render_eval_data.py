@@ -1,3 +1,16 @@
+"""
+Assemble RGB frames and object masks for render-space evaluation.
+
+Inputs
+------
+- Processed case data in ``data/different_types/<case>/`` (RGB images, masks, ``split.json``).
+- ``data_config.csv`` listing available cases and categories.
+
+Outputs
+-------
+- Evaluation datasets under ``data/render_eval_data/<case>/`` including RGB copies and per-camera object masks.
+"""
+
 import os
 import csv
 import json

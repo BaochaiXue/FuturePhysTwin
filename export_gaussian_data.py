@@ -1,21 +1,49 @@
-import os
+"""Export first-frame assets needed by the canonical Gaussian pipeline.
+
+Inputs
+------
+- ``data_config.csv`` listing ``case_name, category, shape_prior`` rows.
+- Processed case data under ``./data/different_types/<case_name>/`` containing RGB/depth/mask,
+  ``calibrate.pkl``, ``metadata.json``, point clouds, and optional shape priors.
+
+Outputs
+-------
+- Per-case folder ``./data/gaussian_data/<case_name>/`` with RGB/depth/mask copies, upsampled
+  variants, human/object masks, camera metadata, observation point cloud, optional shape prior,
+  and generated ``interp_poses.pkl`` ready for downstream rendering.
+"""
+
 import csv
 import json
 import pickle
+import shutil
+import subprocess
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 
-base_path = "./data/different_types"
-output_path = "./data/gaussian_data"
+base_path = Path("./data/different_types")
+output_path = Path("./data/gaussian_data")
 CONTROLLER_NAME = "hand"
 
 
-def existDir(dir_path):
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-existDir(output_path)
+ensure_dir(output_path)
+# generate interp_poses.pkl
+print(f"[info] Generating interp_poses.pkl")
+subprocess.run(
+    [
+        "python",
+        "./gaussian_splatting/generate_interp_poses.py",
+        "--root_dir",
+        str(output_path),
+    ],
+    check=True,
+)
 
 with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
     reader = csv.reader(csvfile)
@@ -24,21 +52,24 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
         category = row[1]
         shape_prior = row[2]
 
-        if not os.path.exists(f"{base_path}/{case_name}"):
+        case_dir = base_path / case_name
+        if not case_dir.exists():
             continue
 
         print(f"Processing {case_name}!!!!!!!!!!!!!!!")
 
         # Create the directory for the case
-        existDir(f"{output_path}/{case_name}")
+        dest_case_dir = output_path / case_name
+        ensure_dir(dest_case_dir)
         for i in range(3):
             # Copy the original RGB image
-            os.system(
-                f"cp {base_path}/{case_name}/color/{i}/0.png {output_path}/{case_name}/{i}.png"
-            )
+            src_rgb = case_dir / "color" / str(i) / "0.png"
+            shutil.copy2(src_rgb, dest_case_dir / f"{i}.png")
             # Copy the original mask image
             # Get the mask path for the image
-            with open(f"{base_path}/{case_name}/mask/mask_info_{i}.json", "r") as f:
+            with (case_dir / "mask" / f"mask_info_{i}.json").open(
+                "r", encoding="utf-8"
+            ) as f:
                 data = json.load(f)
             obj_idx = None
             for key, value in data.items():
@@ -46,54 +77,99 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                     if obj_idx is not None:
                         raise ValueError("More than one object detected.")
                     obj_idx = int(key)
-            mask_path = f"{base_path}/{case_name}/mask/{i}/{obj_idx}/0.png"
-            os.system(f"cp {mask_path} {output_path}/{case_name}/mask_{i}.png")
+            mask_path = case_dir / "mask" / str(i) / str(obj_idx) / "0.png"
+            shutil.copy2(mask_path, dest_case_dir / f"mask_{i}.png")
             # Prepare the high-resolution image
-            os.system(
-                f"python ./data_process/image_upscale.py --img_path {base_path}/{case_name}/color/{i}/0.png --output_path {output_path}/{case_name}/{i}_high.png --category {category}"
+            subprocess.run(
+                [
+                    "python",
+                    "./data_process/image_upscale.py",
+                    "--img_path",
+                    str(src_rgb),
+                    "--output_path",
+                    str(dest_case_dir / f"{i}_high.png"),
+                    "--category",
+                    category,
+                ],
+                check=True,
             )
             # Prepare the segmentation mask of the high-resolution image
-            os.system(
-                f"python ./data_process/segment_util_image.py --img_path {output_path}/{case_name}/{i}_high.png --TEXT_PROMPT {category} --output_path {output_path}/{case_name}/mask_{i}_high.png"
+            subprocess.run(
+                [
+                    "python",
+                    "./data_process/segment_util_image.py",
+                    "--img_path",
+                    str(dest_case_dir / f"{i}_high.png"),
+                    "--TEXT_PROMPT",
+                    category,
+                    "--output_path",
+                    str(dest_case_dir / f"mask_{i}_high.png"),
+                ],
+                check=True,
             )
 
             # Copy the original depth image
-            os.system(
-                f"cp {base_path}/{case_name}/depth/{i}/0.npy {output_path}/{case_name}/{i}_depth.npy"
+            shutil.copy2(
+                case_dir / "depth" / str(i) / "0.npy",
+                dest_case_dir / f"{i}_depth.npy",
             )
 
             # Prepare the human mask for the low-resolution image and high-resolution image
-            os.system(
-                f"python ./data_process/segment_util_image.py --img_path {output_path}/{case_name}/{i}.png --TEXT_PROMPT 'human' --output_path {output_path}/{case_name}/mask_human_{i}.png"
+            subprocess.run(
+                [
+                    "python",
+                    "./data_process/segment_util_image.py",
+                    "--img_path",
+                    str(dest_case_dir / f"{i}.png"),
+                    "--TEXT_PROMPT",
+                    "human",
+                    "--output_path",
+                    str(dest_case_dir / f"mask_human_{i}.png"),
+                    "--exclude_mask_path",
+                    str(dest_case_dir / f"mask_{i}.png"),
+                ],
+                check=True,
             )
-            os.system(
-                f"python ./data_process/segment_util_image.py --img_path {output_path}/{case_name}/{i}_high.png --TEXT_PROMPT 'human' --output_path {output_path}/{case_name}/mask_human_{i}_high.png"
+            subprocess.run(
+                [
+                    "python",
+                    "./data_process/segment_util_image.py",
+                    "--img_path",
+                    str(dest_case_dir / f"{i}_high.png"),
+                    "--TEXT_PROMPT",
+                    "human",
+                    "--output_path",
+                    str(dest_case_dir / f"mask_human_{i}_high.png"),
+                    "--exclude_mask_path",
+                    str(dest_case_dir / f"mask_{i}_high.png"),
+                ],
+                check=True,
             )
 
         # Prepare the intrinsic and extrinsic parameters
-        with open(f"{base_path}/{case_name}/calibrate.pkl", "rb") as f:
+        with (case_dir / "calibrate.pkl").open("rb") as f:
             c2ws = pickle.load(f)
-        with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
+        with (case_dir / "metadata.json").open("r", encoding="utf-8") as f:
             intrinsics = json.load(f)["intrinsics"]
         data = {}
         data["c2ws"] = c2ws
         data["intrinsics"] = intrinsics
-        with open(f"{output_path}/{case_name}/camera_meta.pkl", "wb") as f:
+        with (dest_case_dir / "camera_meta.pkl").open("wb") as f:
             pickle.dump(data, f)
 
         # Prepare the shape initialization data
         # If with shape prior, then copy the shape prior data
         if shape_prior.lower() == "true":
-            os.system(
-                f"cp {base_path}/{case_name}/shape/matching/final_mesh.glb {output_path}/{case_name}/shape_prior.glb"
-            )
+            shape_src = case_dir / "shape" / "matching" / "final_mesh.glb"
+            if shape_src.exists():
+                shutil.copy2(shape_src, dest_case_dir / "shape_prior.glb")
         # Save the original pcd data into the world coordinate system
         obs_points = []
         obs_colors = []
-        pcd_path = f"{base_path}/{case_name}/pcd/0.npz"
-        processed_mask_path = f"{base_path}/{case_name}/mask/processed_masks.pkl"
+        pcd_path = case_dir / "pcd" / "0.npz"
+        processed_mask_path = case_dir / "mask" / "processed_masks.pkl"
         data = np.load(pcd_path)
-        with open(processed_mask_path, "rb") as f:
+        with processed_mask_path.open("rb") as f:
             processed_masks = pickle.load(f)
         for i in range(3):
             points = data["points"][i]
@@ -110,4 +186,4 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
         pcd.colors = o3d.utility.Vector3dVector(obs_colors)
         # coordinate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
         # o3d.visualization.draw_geometries([pcd, coordinate])
-        o3d.io.write_point_cloud(f"{output_path}/{case_name}/observation.ply", pcd)
+        o3d.io.write_point_cloud(str(dest_case_dir / "observation.ply"), pcd)

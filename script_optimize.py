@@ -1,3 +1,16 @@
+"""
+Launch CMA-ES optimisation for each case using the processed datasets.
+
+Inputs
+------
+- ``data/different_types/<case>/final_data.pkl`` along with calibration and metadata (calibrate.pkl, metadata.json).
+- Train/test split metadata in ``data/different_types/<case>/split.json``.
+
+Outputs
+-------
+- Optimisation logs and ``optimal_params.pkl`` stored under ``experiments_optimization/<case>/``.
+"""
+
 import glob
 import os
 import json

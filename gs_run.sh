@@ -1,28 +1,35 @@
+#!/bin/bash
+#
+# Inputs:
+#   - Preprocessed scene folders under ./data/gaussian_data/<scene>/ containing RGB/masks/depth,
+#     camera_meta.pkl, observation.ply, and optional shape_prior.glb.
+#   - Helper scripts: gaussian_splatting/generate_interp_poses.py, gs_train.py, gs_render.py,
+#     gaussian_splatting/img2video.py.
+#
+# Outputs:
+#   - Trained Gaussian checkpoints and renders stored in ./gaussian_output/<scene>/<exp_name>/.
+#   - Rendered evaluation frames (ours_10000/renders) within each scene’s output directory.
+#   - Preview videos exported to ./gaussian_output_video/<scene>/<exp_name>.mp4.
+
 output_dir="./gaussian_output"
 output_video_dir="./gaussian_output_video"
-# scenes=("double_lift_cloth_1" "double_lift_cloth_3" "double_lift_sloth" "double_lift_zebra"
-#         "double_stretch_sloth" "double_stretch_zebra"
-#         "rope_double_hand"
-#         "single_clift_cloth_1" "single_clift_cloth_3"
-#         "single_lift_cloth" "single_lift_cloth_1" "single_lift_cloth_3" "single_lift_cloth_4"
-#         "single_lift_dinosor" "single_lift_rope" "single_lift_sloth" "single_lift_zebra"
-#         "single_push_rope" "single_push_rope_1" "single_push_rope_4"
-#         "single_push_sloth"
-#         "weird_package")
-
-scenes=("double_stretch_sloth")
+mkdir -p "${output_dir}" "${output_video_dir}"
 
 exp_name="init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
 
-python ./gaussian_splatting/generate_interp_poses.py
+python ./gaussian_splatting/generate_interp_poses.py --root_dir ./data/gaussian_data
 
-# Iterate over each folder
-for scene_name in "${scenes[@]}"; do
+# Iterate over every scene folder under data/gaussian_data
+for scene_path in ./data/gaussian_data/*/; do
+    if [[ ! -d "${scene_path}" ]]; then
+        continue
+    fi
+    scene_name="$(basename "${scene_path%/}")"
     echo "Processing: $scene_name"
 
     # Training
     python gs_train.py \
-        -s ./data/gaussian_data/${scene_name} \
+        -s "${scene_path%/}" \
         -m ${output_dir}/${scene_name}/${exp_name} \
         --iterations 10000 \
         --lambda_depth 0.001 \
@@ -35,7 +42,7 @@ for scene_name in "${scenes[@]}"; do
 
     # Rendering
     python gs_render.py \
-        -s ./data/gaussian_data/${scene_name} \
+        -s "${scene_path%/}" \
         -m ${output_dir}/${scene_name}/${exp_name} \
 
     # Convert images to video

@@ -210,3 +210,12 @@ cython_debug/
 !assets/arrow_fill_v1.png
 !assets/Picture1.png
 !assets/Picture2.png
+
+*.err
+*.out
+logs/
+per_frame_gaussian_output_video
+per_frame_gaussian_data
+per_frame_gaussian_output
+tmp_gaussian_output
+tmp_gaussian_output_video

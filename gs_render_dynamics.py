@@ -45,6 +45,7 @@ from gaussian_splatting.dynamic_utils import (
     mat2quat,
 )
 import pickle
+from typing import Optional
 
 
 def render_set(
@@ -57,10 +58,22 @@ def render_set(
     train_test_exp,
     separate_sh,
     disable_sh=False,
+    extra_black: bool = True,
+    black_background: Optional[torch.Tensor] = None,
+    black_output_path: Optional[str] = None,
+    black_suffix: str = "_black",
 ):
 
     render_path = os.path.join(output_path, name)
     makedirs(render_path, exist_ok=True)
+    if extra_black:
+        if black_background is None:
+            raise ValueError("Black background tensor required when extra_black=True.")
+        black_root = black_output_path if black_output_path is not None else output_path
+        black_render_root = os.path.join(black_root, name)
+        makedirs(black_render_root, exist_ok=True)
+    else:
+        black_render_root = None
 
     # view_indices = [0, 25, 50, 75, 100, 125]
     view_indices = [0, 50, 100]
@@ -72,6 +85,11 @@ def render_set(
         # view_render_path = os.path.join(render_path, '{0:05d}'.format(view_idx))
         view_render_path = os.path.join(render_path, f"{idx}")
         makedirs(view_render_path, exist_ok=True)
+        if extra_black:
+            black_view_path = os.path.join(black_render_root, f"{idx}{black_suffix}")
+            makedirs(black_view_path, exist_ok=True)
+        else:
+            black_view_path = None
 
         for frame_idx, gaussians in enumerate(gaussians_list):
 
@@ -97,11 +115,37 @@ def render_set(
                 )
 
             rendering = results["render"]
+            # Persist white-background render to per-view folder
 
             torchvision.utils.save_image(
                 rendering,
                 os.path.join(view_render_path, "{0:05d}".format(frame_idx) + ".png"),
             )
+            if extra_black and black_view_path is not None:
+                if disable_sh:
+                    results_black = render(
+                        view,
+                        gaussians,
+                        pipeline,
+                        black_background,
+                        override_color=override_color,
+                        use_trained_exp=train_test_exp,
+                        separate_sh=separate_sh,
+                    )
+                else:
+                    results_black = render(
+                        view,
+                        gaussians,
+                        pipeline,
+                        black_background,
+                        use_trained_exp=train_test_exp,
+                        separate_sh=separate_sh,
+                    )
+                rendering_black = results_black["render"]
+                torchvision.utils.save_image(
+                    rendering_black,
+                    os.path.join(black_view_path, "{0:05d}".format(frame_idx) + ".png"),
+                )
 
 
 def render_sets(
@@ -114,12 +158,17 @@ def render_sets(
     remove_gaussians: bool = False,
     name: str = "dynamic",
     output_dir: str = "./gaussian_output_dynamic",
+    white_override: bool = False,
+    black_suffix: str = "_black",
 ):
     with torch.no_grad():
         output_path = output_dir
 
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        white_background = dataset.white_background or white_override
+        bg_color = [1, 1, 1] if white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        black_background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        black_path = output_dir
 
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -219,6 +268,10 @@ def render_sets(
             dataset.train_test_exp,
             separate_sh,
             disable_sh=dataset.disable_sh,
+            extra_black=True,
+            black_background=black_background,
+            black_output_path=black_path,
+            black_suffix=black_suffix,
         )
 
 
@@ -299,6 +352,7 @@ if __name__ == "__main__":
         args.remove_gaussians,
         args.name,
         args.output_dir,
+        white_override=args.white_background,
     )
 
     with open("./rendering_finished_dynamic.txt", "a") as f:

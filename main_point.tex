@@ -1,0 +1,200 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+
+\setlist[itemize]{left=0pt,label=--,itemsep=.25em,topsep=.25em}
+\setlist[description]{leftmargin=1.6em,style=nextline}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{\textbf{PhysTwin Pipeline Cheatsheet}\\
+\large (from \code{all\_code.md})}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Prerequisites}
+
+\begin{itemize}
+  \item \textbf{Processed data ready.} Each case under \code{data/different\_types/\{case\}} must already contain \code{final\_data.pkl}, \code{split.json}, calibrated cameras, and masks produced by the data-processing pipeline \emph{before} running any training scripts (\code{script\_optimize.py:5--17}, \code{process\_data.py:153--172}).
+  \item \textbf{Simulation configs.} Material-specific hyperparameters are loaded from \code{configs/cloth.yaml} or \code{configs/real.yaml} at every downstream stage; keep these files consistent across runs (\code{optimize\_cma.py:43--46}, \code{train\_warp.py:37--40}, \code{inference\_warp.py:37--40}).
+  \item \textbf{W\&B \& GPU.} Training relies on CUDA, Warp, and optional \code{wandb} logging initialized inside the trainer; ensure credentials and GPUs are available (\code{qqtt/engine/trainer\_warp.py:104--151}, \code{qqtt/engine/trainer\_warp.py:187--215}).
+\end{itemize}
+
+\section{Zero-Order Optimization (\code{python\ script\_optimize.py})}
+
+\begin{description}
+  \item[Inputs.] Per-case \code{final\_data.pkl}, \code{split.json}, \code{metadata.json}, \code{calibrate.pkl}, and raw RGB folders for overlays. \code{script\_optimize.py} iterates cases and spawns \code{optimize\_cma.py} (\code{script\_optimize.py:5--18}, \code{optimize\_cma.py:50--67}).
+  \item[Outputs.] CMA-ES logs under \code{experiments\_optimization/\{case\}/optimizeCMA/}, including diagnostic videos \code{init.mp4}/\code{optimal.mp4}; tuned parameters saved as \code{optimal\_params.pkl} plus a textual log (\code{qqtt/engine/cma\_optimize\_warp.py:237--288}).
+  \item[Goal.] Coarsely fit non-differentiable simulator hyperparameters (e.g., spring radii, collision coefficients, damping) to seed later gradient-based training (\code{qqtt/engine/cma\_optimize\_warp.py:245--284}).
+  \item[Mandatory?] \textbf{Yes.} \code{train\_warp.py} refuses to start if \code{optimal\_params.pkl} is missing (\code{train\_warp.py:46--53}).
+\end{description}
+
+\section{First-Order Training (\code{python\ script\_train.py})}
+
+\begin{description}
+  \item[Inputs.] Uses CMA outputs and the same observation bundle. \code{train\_warp.py} loads \code{optimal\_params.pkl}, camera calibration, and \code{final\_data.pkl}, honoring the train/test split (\code{train\_warp.py:44--72}).
+  \item[Outputs.] Learning curves and videos in \code{experiments/\{case\}/train/} (e.g., \code{init.mp4}, \code{sim\_iter\{k\}.mp4}); checkpoints \code{iter\_\{k\}.pth} and best weights \code{best\_\{epoch\}.pth}. \code{wandb} mirrors these artifacts (\code{qqtt/engine/trainer\_warp.py:305--388}).
+  \item[Goal.] Differentiate through the Warp-based simulator to refine spring stiffness and collision parameters against dense point cloud and trajectory supervision (\code{qqtt/engine/trainer\_warp.py:311--358}).
+  \item[Mandatory?] \textbf{Yes} for downstream inference/evaluation; produces the checkpoints expected by \code{script\_inference.py} (\code{qqtt/engine/trainer\_warp.py:332--376}).
+\end{description}
+
+\section{Inference (\code{python\ script\_inference.py})}
+
+\begin{description}
+  \item[Inputs.] Scans \code{experiments/\{case\}/train/best\_*.pth}; reuses \code{final\_data.pkl}, camera intrinsics, and CMA results to ensure topology alignment (\code{script\_inference.py:6--12}, \code{inference\_warp.py:44--100}).
+  \item[Outputs.] Rollout video \code{experiments/\{case\}/inference.mp4}; simulated trajectories \code{experiments/\{case\}/inference.pkl}; debug log \code{inference\_log.log} (\code{qqtt/engine/trainer\_warp.py:418--442}).
+  \item[Goal.] Replay the trained PhysTwin on the full sequence to generate meshes/point paths for evaluation or visualization (\code{qqtt/engine/trainer\_warp.py:418--452}).
+  \item[Mandatory?] \textbf{Optional}—run when you need inference artifacts or to validate checkpoints; training weights remain usable without this step.
+\end{description}
+
+\section{First-Frame Gaussian Splatting (\code{bash\ gs\_run.sh})}
+
+\begin{description}
+  \item[Inputs.] Requires pre-exported first-frame dataset under \code{data/gaussian\_data/\{case\}} (via \code{export\_gaussian\_data.py:8--92}) and the scene list configured in the script (\code{gs\_run.sh:13--44}).
+  \item[Outputs.] Learned splats under \code{gaussian\_output/\{case\}/\{exp\_name\}/} (weights, rendered novel views) and compiled evaluation videos at \code{gaussian\_output\_video/\{case\}/\{exp\_name\}.mp4} (\code{gs\_run.sh:24--44}).
+  \item[Goal.] Train view-consistent radiance fields from single-frame RGB-D observations for rendering, evaluation, or visualization.
+  \item[Mandatory?] \textbf{Optional} for core PhysTwin training; \textbf{required} if you plan to render first-frame Gaussians or run later evaluation scripts (\code{README.md:170--191}).
+\end{description}
+
+\paragraph{Natural next steps.}
+\begin{enumerate}
+  \item Inspect \code{experiments\_optimization} and \code{experiments} for any failed cases before scaling to the full dataset.
+  \item Update the \code{scenes} array in \code{gs\_run.sh} once you have generated Gaussian inputs for additional scenarios.
+\end{enumerate}
+
+\section{How the Scripts Work (Implementation Notes)}
+
+\subsection{Zero-Order Optimization Details}
+
+\begin{itemize}
+  \item \textbf{Launcher.} \code{script\_optimize.py:5--18} iterates processed cases, reads the train/test split (\code{split.json}), extracts the cutoff frame, and shells into \code{optimize\_cma.py} with the case name and frame count.
+  \item \textbf{Setup.} \code{optimize\_cma.py:43--67} reloads the material YAML config, camera extrinsics (\code{calibrate.pkl}) and intrinsics (\code{metadata.json}), and points \code{cfg.data\_path} at trajectories in \code{final\_data.pkl}, recreating the full observation geometry and camera overlays for loss evaluation.
+  \item \textbf{CMA-ES loop.} In \code{qqtt/engine/cma\_optimize\_warp.py}, \code{OptimizerCMA.optimize} seeds CMA-ES with normalized versions of simulator knobs (e.g., spring Young's modulus, neighbor radii, collision friction, damping). Each candidate is denormalized and scored via \code{error\_func}, which rebuilds the spring--mass graph from \code{final\_data.pkl} and rolls out the Warp simulator against captured point clouds.
+  \item \textbf{Diagnostics \& artifact.} Before and after the loop, the code renders \code{optimizeCMA/init.mp4} (defaults) and \code{optimizeCMA/optimal.mp4} (best CMA). Upon termination, it writes \code{experiments\_optimization/\{case\}/optimal\_params.pkl}, alongside videos and logs (\code{qqtt/engine/cma\_optimize\_warp.py:237--288}).
+  \item \textbf{Downstream requirement.} \code{train\_warp.py} asserts the existence of \code{experiments\_optimization/\{case\}/optimal\_params.pkl} before training (\code{train\_warp.py:46--53}); the CMA pass is therefore mandatory.
+\end{itemize}
+
+\subsection{First-Order Training Details}
+
+\begin{itemize}
+  \item \textbf{Orchestration.} \code{script\_train.py} loops over processed cases and invokes \code{train\_warp.py} with the cutoff frame from \code{split.json}.
+  \item \textbf{Critical reloads (\code{train\_warp.py:44--72}).}
+  \begin{itemize}
+    \item \code{experiments\_optimization/\{case\}/optimal\_params.pkl}: zero-order CMA results that initialize non-differentiable simulator knobs (\code{train\_warp.py:46--53}).
+    \item Camera geometry from \code{calibrate.pkl} and \code{metadata.json} for projection (\code{train\_warp.py:55--65}).
+    \item Observation bundle \code{final\_data.pkl} (object tracks, controller trajectories, optional shape-prior samples).
+  \end{itemize}
+  \item \textbf{Trainer.} With these, \code{InvPhyTrainerWarp} constructs a spring--mass system from first-frame geometry, binds controller targets to recorded hand motion, and runs a Warp-based differentiable simulator (\code{qqtt/engine/trainer\_warp.py:45--204}).
+  \item \textbf{Learning step.} For each iteration (\code{qqtt/engine/trainer\_warp.py:305--358}), the simulator rolls out to the train cutoff, compares simulated points against real data (Chamfer + trajectory losses), backpropagates through the tape, and updates differentiable parameters (spring stiffness, collision frictions, damping).
+  \item \textbf{Saved artifacts.} The trainer writes: (i) \code{experiments/\{case\}/train/init.mp4}; (ii) periodic \code{sim\_iter\{k\}.mp4} and matching \code{wandb} uploads; (iii) checkpoints \code{iter\_\{k\}.pth} and the best \code{best\_\{epoch\}.pth} (\code{qqtt/engine/trainer\_warp.py:332--376}).
+  \item \textbf{Why mandatory.} \code{inference\_warp.py} searches \code{experiments/\{case\}/train/best\_*.pth} for evaluation; skipping first-order training leaves no checkpoint to load.
+\end{itemize}
+
+\subsection{Inference Details}
+
+\begin{itemize}
+  \item \textbf{Launcher.} After training, \code{script\_inference.py:6--12} loops cases and launches \code{inference\_warp.py}, mirroring the training setup: reloads \code{optimal\_params.pkl}, camera calibration, and \code{final\_data.pkl} (\code{inference\_warp.py:44--73}).
+  \item \textbf{Checkpoint selection.} \code{inference\_warp.py:76--99} scans for \code{train/best\_*.pth}, filters out mismatched spring topologies, and picks the highest-epoch match.
+  \item \textbf{Test rollouts.} With \code{InvPhyTrainerWarp} in inference mode, \code{trainer.test} replays the full sequence, saving \code{experiments/\{case\}/inference.mp4}, per-frame vertex trajectories \code{inference.pkl}, and \code{inference\_log.log} (\code{qqtt/engine/trainer\_warp.py:418--442}).
+\end{itemize}
+
+\subsection{Gaussian Splatting Details}
+
+\begin{itemize}
+  \item \textbf{Data export.} Run \code{export\_gaussian\_data.py} to create \code{data/gaussian\_data/\{case\}/} (RGB, segmentation masks, depth, camera metadata, optional shape priors; \code{export\_gaussian\_data.py:8--92}).
+  \item \textbf{Training \& rendering.} \code{gs\_run.sh:13--44} sets the scene list and experiment name, trains with \code{gs\_train.py}, renders views via \code{gs\_render.py}, and packages videos with \code{gaussian\_splatting/img2video.py}.
+  \item \textbf{Results.} Checkpoints/renderings under \code{gaussian\_output/\{case\}/\{exp\_name\}/}; compiled video at \code{gaussian\_output\_video/\{case\}/\{exp\_name\}.mp4}.
+  \item \textbf{Optionality.} Not required for core PhysTwin training; needed for first-frame Gaussian reconstructions or the README evaluation (\code{README.md:170--191}).
+\end{itemize}
+
+\section{Prerequisites}
+\begin{itemize}[leftmargin=1.25em]
+  \item \textbf{Inputs available per case:} multi-view RGB videos (\code{color/<cam>.mp4}), depth arrays (\code{depth/<cam>/<frame>.npy}), and camera intrinsics/extrinsics (e.g., \code{metadata.json}, \code{calibrate.pkl}).
+  \item \textbf{Software \& models:} Grounded-SAM2 (Grounding DINO + SAM2), CoTracker, diffusion upscaler (\code{stabilityai/stable-diffusion-x4-upscaler}), and TRELLIS image-to-3D (\code{JeffreyXiang/TRELLIS-image-large}) when shape priors are enabled.
+  \item \textbf{Project layout assumptions:} three calibrated cameras; stage toggles in \code{process_data.py} default to enabled (\code{PROCESS_* = True}); optional shape prior controlled by a \code{--shape_prior} flag.
+\end{itemize}
+
+\section{Pipeline Overview}
+\subsection{Orchestration (mandatory)}
+\textit{What runs:} \code{script_process_data.py} walks \code{data_config.csv}, clears \code{timer.log}, and launches \code{process_data.py} for each case with the requested \code{shape_prior} flag; \code{process_data.py} exposes per-stage toggles (default \code{True}).\\
+\textbf{Input:} \code{data_config.csv}. \quad
+\textbf{Output:} logged timings and one \code{process_data} run per case (\code{script_process_data.py:4, :6, :8, :20; process_data.py:21}).
+
+\subsection{Segmentation (mandatory)}
+\textit{What runs:} \code{process_data.py} prompts Grounded-SAM2 with \verb|{category}.hand| to extract controller/object masks per camera (\code{process_data.py:31, :81}). \code{segment.py} verifies camera count and dispatches \code{segment_util_video.py} (\code{segment.py:23}). \\
+\textbf{Inputs:} multi-view RGB videos; depth folders confirm camera count. \\
+\textbf{Outputs:} per-frame binary masks at \code{mask/<cam>/<obj>/<frame>.png} and label maps \code{mask_info_<cam>.json} (\code{segment_util_video.py:196, :202}). \\
+\textbf{Purpose:} clean silhouettes for controller and object.
+
+\subsection{Shape-prior preparation (optional; only when \code{shape_prior} is true)}
+\textit{What runs:} crop \& upscale first frame (\code{image_upscale.py:45}); re-segment high-res still (\code{segment_util_image.py:123}); run TRELLIS to export mesh/gaussian + diagnostic video (\code{shape_prior.py:44, :54}). \\
+\textbf{Inputs:} first-frame RGB, its mask, and category prompt (\code{process_data.py:89}). \\
+\textbf{Outputs:} \code{shape/high_resolution.png}, \code{shape/masked_image.png}, \code{shape/object.glb}, \code{shape/object.ply}, \code{shape/visualization.mp4}. \\
+\textbf{Purpose:} high-quality geometric prior for downstream alignment.
+
+\subsection{Dense tracking (mandatory)}
+\textit{What runs:} CoTracker samples up to 5\,000 masked pixels per view and tracks through time (\code{process_data.py:120; dense_track.py:42, :90, :95}). \\
+\textbf{Inputs:} RGB videos and first-frame masks. \\
+\textbf{Outputs:} \code{cotracker/<cam>.npz} (tracks + visibilities) and preview videos. \\
+\textbf{Purpose:} dense 2D motion cues for object and controller.
+
+\subsection{3D fusion \& post-processing (mandatory)}
+\textit{What runs:} fuse multi-view RGB-D frames into per-frame world point clouds (\code{data_process/data_process_pcd.py:165, :224}); denoise masks with depth-aware outlier removal to produce \code{mask/processed_masks.pkl} (\code{process_data.py:127; data_process/data_process_mask.py:214}); filter/merge tracks into \code{track_process_data.pkl} (\code{process_data.py:140; data_process/data_process_track.py:459}). \\
+\textbf{Inputs:} camera intrinsics/extrinsics, depth \code{.npy}, calibrated masks, CoTracker output. \\
+\textbf{Purpose:} consistent 3D observations for object/controller while pruning spurious measurements.
+
+\subsection{Alignment \& final packaging}
+\textit{What runs:} if a prior exists, align mesh pose/scale to partial observations, exporting \code{shape/matching/final_mesh.glb}, \code{final_matching.mp4}, and diagnostics (\code{process_data.py:146; data_process/align.py:349, :531, :552}). Then subsample object points, augment with prior samples if available, render quality checks, and serialize the dataset: \code{final_pcd.mp4}, \code{final_data.pkl}, \code{final_data.mp4}, plus a 70/30 temporal split in \code{split.json} (\code{process_data.py:153; data_process/data_process_sample.py:125, :174, :238; process_data.py:171}). \\
+\textbf{Purpose:} training-ready package for subsequent inverse-physics stages.
+
+\subsection{Next steps (if needed)}
+\begin{enumerate}[leftmargin=1.25em]
+  \item Inspect \code{timer.log} to spot slow stages per case.
+  \item Adjust \code{PROCESS_*} toggles or per-stage scripts to skip/customize parts before re-running.
+\end{enumerate}
+
+\section{Segmentation (details)}
+Segmentation turns raw multi-view videos into clean binary masks for the object and controller. \code{process_data.py} builds the text prompt \verb|{category}.hand| so Grounded-SAM2 looks for ``hand'' plus the object class (\code{process_data.py:31, :81}). It launches \code{data_process/segment.py}, which verifies there are three camera streams, iterates over them, and calls \code{segment_util_video.py} for each (\code{data_process/segment.py:23}). Inside \code{segment_util_video.py}, the RGB video is unpacked into frames, Grounding DINO finds the bounding box that matches the prompt, and SAM2 seeds on that box to generate a mask on the key frame. The SAM2 video predictor propagates that mask through the full clip. The script writes one mask folder per camera/object ID (\code{mask/<camera>/<id>/<frame>.png}) and a lookup table that maps controller vs.\ object (\code{mask_info_<camera>.json}; \code{data_process/segment_util_video.py:196, :202}). The result is a pair of dense silhouettes per frame that later steps (tracking, 3D fusion, controller filtering) depend on.
+
+\section{Shape-Prior Preparation (runs only when \code{--shape_prior} is set)}
+\subsection{Stage gating \& outputs}
+\code{process_data.py} checks both the stage toggle and the CLI flag (\code{process_data.py:89}). It loads \code{mask_info_0.json} to find which object ID corresponds to the non-hand target (\code{process_data.py:91--99}), forms a base mask path for frame 0 (\code{process_data.py:99}), and writes artifacts under \code{shape/}.
+
+\subsection{High-res crop via diffusion upscale}
+\code{image_upscale.py} loads \code{stabilityai/stable-diffusion-x4-upscaler} with half precision on CUDA (\code{image_upscale.py:25--29}); reads first-frame RGB \code{color/0/0.png} and binary mask \code{mask/0/<obj_id>/0.png} (\code{image_upscale.py:31--34}); enlarges the bounding box by 20\% (clamped to bounds) and crops the image (\code{image_upscale.py:35--41}). The diffusion pipeline runs with prompt \verb|Hand manipulates a {category}.| and saves to \code{shape/high_resolution.png} (\code{image_upscale.py:43--45}).
+
+\subsection{Single-image segmentation of the upscaled crop}
+\code{segment_util_image.py} pairs Grounding DINO with SAM2’s image predictor: lowercases the prompt, runs DINO for boxes, converts to pixel boxes, then feeds SAM2 (\code{segment_util_image.py:61--99}). The resulting mask is applied to the high-res RGB to yield an RGBA image \code{shape/masked_image.png} (\code{segment_util_image.py:114--123}).
+
+\subsection{3D prior synthesis with TRELLIS}
+\code{shape_prior.py} loads \code{JeffreyXiang/TRELLIS-image-large} on CUDA (\code{shape_prior.py:27, :33}) and asserts the masked image has non-opaque alpha (\code{shape_prior.py:37}). The pipeline returns gaussian and mesh representations; a side-by-side diagnostic video is rendered (\code{visualization.mp4}; \code{shape_prior.py:40--44}). It exports \code{object.glb} (simplified mesh with baked texture; \code{shape_prior.py:46--54}) and \code{object.ply} (raw gaussian splats; \code{shape_prior.py:56--57}).
+
+\subsection{Why this optional stage matters}
+These assets provide a high-quality prior that guides \code{align.py}. Upscaling \& re-segmentation reduce background contamination; TRELLIS supplies a globally consistent 3D shape, easing registration of partial observations to a full mesh. If the flag is absent, later stages use only captured point clouds.
+
+\section{Dense Tracking (details)}
+Triggered when \code{PROCESS_TRACK} is \code{True} (\code{process_data.py:120}) which launches \code{data_process/dense_track.py}. The script validates three cameras (\code{dense_track.py:24}) and prepares \code{cotracker/} outputs (\code{dense_track.py:41}). For each camera it loads the RGB video and moves it to CUDA (\code{dense_track.py:47--50}); unions all masks at frame 0 (\code{mask/<cam>/*/0.png}) to build a binary seed (\code{dense_track.py:52--59}); samples up to 5\,000 query pixels inside the mask (\code{dense_track.py:62--70}); initializes CoTracker online (\code{dense_track.py:77}); runs chunked inference to produce 2D trajectories and visibilities across the sequence (\code{dense_track.py:82--86}); saves a preview video (\code{dense_track.py:87--90}); and persists \code{cotracker/<cam>.npz} with tracks (\(T \times N \times 2\)) and visibility masks (\code{dense_track.py:92--97}). These dense correspondences are essential for later 3D reconstruction and controller filtering.
+
+\section{3D Fusion \& Post-Processing (details)}
+Under \code{PROCESS_3D}, \code{process_data.py} calls three scripts in sequence (\code{process_data.py:127--143}).
+\paragraph{Point-cloud fusion (\code{data_process/data_process_pcd.py}).}
+Reads intrinsics/extrinsics from \code{metadata.json} and \code{calibrate.pkl} (\code{data_process_pcd.py:160--167}); iterates all frames, back-projects each depth map to world coordinates, and writes per-frame \code{.npz} (points, colors, validity) per camera (\code{data_process_pcd.py:192--224}). Optional Open3D visualization is supported.
+\paragraph{Mask denoising (\code{data_process/data_process_mask.py}).}
+Loads raw masks and PCDs, separates object vs.\ controller via \code{mask_info}, removes radius-outlier points, back-projects outliers to image space, and zeroes those pixels to produce cleaned masks bundled as \code{mask/processed_masks.pkl} (\code{data_process_mask.py:82--136, :214}).
+\paragraph{Track filtering (\code{data_process/data_process_track.py}).}
+Combines CoTracker output with cleaned masks and PCDs: filters track points to remain inside semantic masks across frames (\code{:26--208}); lifts to 3D via per-frame PCDs and prunes inconsistent motion with neighborhood checks (\code{:210--326}); down-samples controller tracks to stable anchors (\code{:328--374}); serializes \code{track_process_data.pkl} and an optional visualization (\code{:459, :378--433}). \\
+\textbf{Purpose:} convert RGB-D, masks, and 2D tracks into consistent world-coordinate observations while discarding outliers.
+
+\section{Alignment \& Final Packaging (details)}
+If \code{SHAPE_PRIOR} is true, \code{process_data.py} invokes \code{data_process/align.py} (\code{process_data.py:146}). The module uses the masked high-res image, TRELLIS mesh, and calibration to match rendered views, solve pose via PnP, and refine scale (\code{align.py:306--468}); applies ARAP deformation and ray-consistency checks to match the observed point clouds; and exports \code{shape/matching/final_mesh.glb} and a turntable video (\code{align.py:483--552}).\\
+Regardless of prior, the pipeline finishes with \code{data_process/data_process_sample.py} (\code{process_data.py:153}): deduplicates tracked object points, optionally augments them with surface/interior samples from the aligned mesh, performs voxel subsampling, renders \code{final_pcd.mp4} (static object cloud) and \code{final_data.mp4} (animated trajectory) for inspection (\code{data_process_sample.py:119--229}), stores \code{final_data.pkl} (object points, visibilities, controller anchors, optional prior samples; \code{:236--239}), and records a 70/30 temporal split in \code{split.json} (\code{process_data.py:165--171}). \\
+\textbf{Purpose:} deliver the training-ready package for downstream inverse-physics modules.
+
+\end{document}

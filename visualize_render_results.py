@@ -1,3 +1,18 @@
+"""
+Blend rendered sequences with original footage and masks to create overlays.
+
+Inputs
+------
+- Dynamic render frames in ``gaussian_output_dynamic_white/<case>/<view>/``.
+- Original RGB frames in ``data/different_types/<case>/color/<camera>/``.
+- Human masks in ``data/different_types_human_mask/<case>/mask/<camera>/``.
+- Object masks in ``data/render_eval_data/<case>/mask/<camera>/``.
+
+Outputs
+-------
+- Overlay videos saved as ``gaussian_output_dynamic_white/<case>/<camera>_integrate.mp4``.
+"""
+
 import glob
 import json
 import numpy as np

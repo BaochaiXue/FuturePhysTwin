@@ -1,4 +1,5 @@
-conda install -y numpy==1.26.4
+pip install numpy==1.26.4
+pip install charset-normalizer
 pip install warp-lang
 pip install usd-core matplotlib
 pip install "pyglet<2"
@@ -42,6 +43,6 @@ cd ../..
 pip install gsplat==1.4.0
 pip install kornia
 cd gaussian_splatting/
-pip install submodules/diff-gaussian-rasterization/
+#pip install submodules/diff-gaussian-rasterization/
 pip install submodules/simple-knn/
 cd ..
