@@ -44,7 +44,7 @@ img_path: str = args.img_path
 output_path: str = args.output_path
 TEXT_PROMPT: str = args.TEXT_PROMPT
 EXCLUDE_MASK_IOU_THRESHOLD = 0.95
-MAX_RETRIES = 5
+MAX_RETRIES = 10
 RETRY_DELAY_SECONDS = 3.0
 logging.basicConfig(
     level=logging.INFO,
@@ -73,7 +73,7 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(intersection) / float(union)
 
 
-def run_segmentation() -> None:
+def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) -> None:
     SAM2_CHECKPOINT = "./data_process/groundedSAM_checkpoints/sam2.1_hiera_large.pt"
     SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
     GROUNDING_DINO_CONFIG = (
@@ -82,8 +82,6 @@ def run_segmentation() -> None:
     GROUNDING_DINO_CHECKPOINT = (
         "./data_process/groundedSAM_checkpoints/groundingdino_swint_ogc.pth"
     )
-    BOX_THRESHOLD: float = 0.35
-    TEXT_THRESHOLD: float = 0.25
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # build SAM2 image predictor
@@ -108,8 +106,8 @@ def run_segmentation() -> None:
         model=grounding_model,
         image=image,
         caption=text,
-        box_threshold=BOX_THRESHOLD,
-        text_threshold=TEXT_THRESHOLD,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
     )
 
     # process the box prompt for SAM 2
@@ -190,6 +188,8 @@ def run_segmentation() -> None:
 
 def main() -> None:
     last_exc: Exception | None = None
+    box_threshold = 0.35
+    text_threshold = 0.25
     for attempt in range(1, MAX_RETRIES + 1):
         if torch.cuda.is_available():
             try:
@@ -212,7 +212,7 @@ def main() -> None:
                 "Attempt %d/%d: CUDA unavailable, running on CPU", attempt, MAX_RETRIES
             )
         try:
-            run_segmentation()
+            run_segmentation(box_threshold=box_threshold, text_threshold=text_threshold)
             return
         except Exception as exc:  # pylint: disable=broad-except
             last_exc = exc
@@ -228,6 +228,11 @@ def main() -> None:
                 torch.cuda.empty_cache()
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SECONDS)
+            box_threshold *= 0.95
+            text_threshold *= 0.95
+            print(
+                f"[Warning] Segmentation attempt {attempt} failed, with box_threshold={box_threshold}, text_threshold={text_threshold}"
+            )
     raise SystemExit(
         f"Segmentation failed after {MAX_RETRIES} attempts; last error: {last_exc}"
     ) from last_exc

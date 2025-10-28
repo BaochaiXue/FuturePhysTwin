@@ -40,6 +40,35 @@ import copy
 import time
 import threading
 import time
+from torch import nn
+
+
+def enforce_isotropic_gaussian_scales(gaussians: GaussianModel) -> None:
+    """
+    Ensure the Gaussian model uses isotropic scaling.
+
+    If the loaded Gaussians carry per-axis log scales (shape N x 3),
+    collapse them to a single log scale using the geometric mean so that
+    ``get_scaling`` returns an (N x 3) tensor after the isotropic repeat.
+    """
+
+    raw_scales = gaussians._scaling
+    if raw_scales.ndim != 2:
+        raise ValueError(
+            f"Expected 2D scaling tensor, got shape {raw_scales.shape} instead."
+        )
+    if raw_scales.shape[1] == 1:
+        # Ensure consistency (wrap as Parameter for downstream accessors).
+        if not isinstance(raw_scales, nn.Parameter):
+            gaussians._scaling = nn.Parameter(raw_scales.detach().clone())
+    else:
+        with torch.no_grad():
+            # Convert per-axis log scale to a single isotropic log scale.
+            isotropic_log_scale = torch.log(
+                torch.exp(raw_scales).mean(dim=1, keepdim=True)
+            )
+        gaussians._scaling = nn.Parameter(isotropic_log_scale)
+    gaussians.isotropic = True
 
 
 class InvPhyTrainerWarp:
@@ -937,7 +966,12 @@ class InvPhyTrainerWarp:
         return self.structure_points[min_idx].unsqueeze(0)
 
     def interactive_playground(
-        self, model_path, gs_path, n_ctrl_parts=1, inv_ctrl=False, virtual_key_input=False
+        self,
+        model_path,
+        gs_path,
+        n_ctrl_parts=1,
+        inv_ctrl=False,
+        virtual_key_input=False,
     ):
         # Load the model
         logger.info(f"Load model from {model_path}")
@@ -985,9 +1019,9 @@ class InvPhyTrainerWarp:
         vis_controller_points = current_target.cpu().numpy()
 
         gaussians = GaussianModel(sh_degree=3)
-        gaussians.load_ply(gs_path)
+        gaussians.load_ply(gs_path, use_train_test_exp=True)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        enforce_isotropic_gaussian_scales(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background
@@ -1067,9 +1101,9 @@ class InvPhyTrainerWarp:
 
         if virtual_key_input:
             # Initialize keyboard tracking variables
-            self.virtual_keys = {}     # Dictionary to track virtual keys with timestamps
+            self.virtual_keys = {}  # Dictionary to track virtual keys with timestamps
             self.virtual_key_duration = 0.03  # Virtual key press duration in seconds
-        
+
         listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         listener.start()
         self.target_change = np.zeros((n_ctrl_parts, 3))
@@ -1237,7 +1271,7 @@ class InvPhyTrainerWarp:
                         self.pressed_keys.add(key_char)
                     elif key == 27:  # ESC key to exit
                         break
-                
+
                 # Process all keyboard inputs (both physical and virtual)
                 # For virtual keys, check if they're still active based on timestamp
                 current_time = time.time()
@@ -1245,14 +1279,14 @@ class InvPhyTrainerWarp:
                 for k, press_time in self.virtual_keys.items():
                     if current_time - press_time > self.virtual_key_duration:
                         keys_to_remove.append(k)
-                
+
                 # Remove expired virtual keys
                 for k in keys_to_remove:
                     if k in self.pressed_keys:
                         self.pressed_keys.discard(k)
                     if k in self.virtual_keys:
                         del self.virtual_keys[k]
-            
+
             frame_comp_time = (
                 frame_timer.stop() + frame_setup_time
             )  # Total frame compositing time
@@ -1470,7 +1504,7 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        enforce_isotropic_gaussian_scales(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background
@@ -1812,7 +1846,7 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        enforce_isotropic_gaussian_scales(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background

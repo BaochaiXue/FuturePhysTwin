@@ -9,6 +9,7 @@ import glob
 import os
 import pickle
 import json
+from pathlib import Path
 
 
 def set_all_seeds(seed):
@@ -84,7 +85,33 @@ if __name__ == "__main__":
     cfg.bg_img_path = args.bg_img_path
 
     exp_name = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
-    gaussians_path = f"{args.gaussian_path}/{case_name}/{exp_name}/point_cloud/iteration_10000/point_cloud.ply"
+    point_cloud_dir = Path(args.gaussian_path) / case_name / exp_name / "point_cloud"
+    if not point_cloud_dir.exists():
+        raise FileNotFoundError(
+            f"Gaussian point cloud directory not found: {point_cloud_dir}"
+        )
+    candidate_point_clouds: list[tuple[int, Path]] = []
+    for iteration_dir in point_cloud_dir.glob("iteration_*"):
+        if not iteration_dir.is_dir():
+            continue
+        try:
+            iteration_id = int(iteration_dir.name.split("_")[-1])
+        except ValueError:
+            continue
+        ply_path = iteration_dir / "point_cloud.ply"
+        if ply_path.exists():
+            candidate_point_clouds.append((iteration_id, ply_path))
+    if not candidate_point_clouds:
+        raise FileNotFoundError(
+            f"No point_cloud.ply files found under {point_cloud_dir}"
+        )
+    best_iteration, best_ply_path = max(
+        candidate_point_clouds, key=lambda item: item[0]
+    )
+    logger.info(
+        f"Using Gaussian point cloud from iteration {best_iteration}: {best_ply_path}"
+    )
+    gaussians_path = str(best_ply_path)
 
     logger.set_log_file(path=base_dir, name="inference_log")
     trainer = InvPhyTrainerWarp(
