@@ -25,19 +25,29 @@ import subprocess
 from pathlib import Path
 import shutil
 from typing import Iterable, Sequence
+import time
 
 
-def run_command(command: Sequence[str]) -> None:
-    """
-    Execute an external command and raise immediately if it fails.
+def run_command(
+    command: Sequence[str], max_attempts: int = 3, sleep_time: float = 2.0
+) -> None:
 
-    Args:
-        command: Full argv list (e.g. ``["python", "script.py", "--flag"]``).
-    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # ``subprocess.run`` returns a ``CompletedProcess`` object; ``check=True`` makes it
+            # raise ``CalledProcessError`` when the exit code is non-zero, preventing silent failures.
+            subprocess.run(list(command), check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            if attempt == max_attempts:
+                raise
 
-    # ``subprocess.run`` returns a ``CompletedProcess`` object; ``check=True`` makes it
-    # raise ``CalledProcessError`` when the exit code is non-zero, preventing silent failures.
-    subprocess.run(list(command), check=True)
+            # Wait a bit before retrying.
+
+            time.sleep(sleep_time)
+            print(
+                f"[Retry {attempt}/{max_attempts}] Command failed with code {exc.returncode}: {' '.join(command)}"
+            )
 
 
 def ensure_dir(path: Path) -> None:
