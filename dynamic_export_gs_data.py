@@ -22,14 +22,38 @@ Outputs
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import Iterable
 
 
-def run_command(cmd: list[str]) -> None:
-    """Execute an external command and raise immediately on failure."""
+def run_command(
+    cmd: list[str], *, attempts: int = 5, delay: float = 2.0, echo: bool = True
+) -> None:
+    """
+    Execute an external command with lightweight retry support.
 
-    subprocess.run(cmd, check=True)
+    Args:
+        cmd: Command (argv style) to execute.
+        attempts: Maximum number of tries before surfacing the failure.
+        delay: Seconds to wait between attempts.
+        echo: When true, print the command on retry to aid debugging.
+    """
+
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            if attempt == attempts:
+                raise
+            if echo:
+                cmd_str = " ".join(str(part) for part in cmd)
+                print(
+                    f"[warn] Command failed (attempt {attempt}/{attempts}): {cmd_str}\n"
+                    f"       Retrying in {delay:.1f}s… ({exc})"
+                )
+            time.sleep(delay)
 
 
 def ensure_dir(path: Path) -> None:

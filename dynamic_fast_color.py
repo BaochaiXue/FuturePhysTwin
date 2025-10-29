@@ -74,7 +74,7 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     SparseGaussianAdam = None  # type: ignore[assignment]
-SPARSE_ADAM_AVAILABLE = False
+    SPARSE_ADAM_AVAILABLE = False
 
 
 def load_canonical_npz(path: Path) -> dict[str, torch.Tensor]:
@@ -210,14 +210,18 @@ def training(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     if color_only:
-        canonical_color_path = canonical_dir / "color_refine" / "canonical_gaussians_color.npz"
+        canonical_color_path = (
+            canonical_dir / "color_refine" / "canonical_gaussians_color.npz"
+        )
         canonical_base_path = canonical_dir / "canonical_gaussians.npz"
         if canonical_color_path.exists():
             try:
                 canonical_color_path.unlink()
                 print(f"[Colour] Removed stale {canonical_color_path}")
             except OSError as exc:
-                print(f"[Colour] Warning: failed to remove {canonical_color_path}: {exc}")
+                print(
+                    f"[Colour] Warning: failed to remove {canonical_color_path}: {exc}"
+                )
         canonical_path = (
             canonical_color_path
             if canonical_color_path.exists()
@@ -317,7 +321,9 @@ def training(
     frame_summary: dict[int, int] = {}
     for frame_id, _ in camera_entries:
         frame_summary[frame_id] = frame_summary.get(frame_id, 0) + 1
-    summary_str = ", ".join(f"{fid}: {count} cams" for fid, count in sorted(frame_summary.items()))
+    summary_str = ", ".join(
+        f"{fid}: {count} cams" for fid, count in sorted(frame_summary.items())
+    )
     print(f"[Frames] Training across frames -> {summary_str}")
 
     entry_pool = list(range(len(camera_entries)))
@@ -408,6 +414,9 @@ def training(
             pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
         else:
             pose_ctx = nullcontext()
+            print(
+                f"[LBS] Warning: skipping LBS deformation for frame {frame_id} in the case of "
+            )
 
         with pose_ctx:
             if dataset.disable_sh:

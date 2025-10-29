@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Markdown snapshot of all Python and YAML source files."""
+"""Generate a Markdown snapshot of all Python, YAML, and shell source files."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ SUFFIX_TO_LANG: dict[str, str] = {
     ".py": "python",
     ".yaml": "yaml",
     ".yml": "yaml",
+    ".sh": "bash",
 }
 
 
@@ -75,7 +76,7 @@ def write_markdown(files: Iterable[Path], root: Path, output_path: Path) -> None
 def main() -> None:
     """Entry point for generating the Markdown snapshot."""
     parser = argparse.ArgumentParser(
-        description="Generate a Markdown file containing all Python and YAML source code."
+        description="Generate a Markdown file containing all Python, YAML, and shell source code."
     )
     parser.add_argument(
         "--root",
