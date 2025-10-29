@@ -104,6 +104,7 @@ def copy_frame_assets(
     frame_idx: int,
     category: str,
     generate_high_png: bool,
+    generate_human_masks: bool = False,
 ) -> None:
     """Copy RGB/depth/mask assets for a single frame and run auxiliary processing."""
 
@@ -169,19 +170,85 @@ def copy_frame_assets(
         )
 
         # Human mask (low-res and high-res)
-        run_python_script(
-            Path("data_process/segment_util_image.py"),
-            [
-                "--img_path",
-                str(output_dir / f"{cam_idx}.png"),
-                "--TEXT_PROMPT",
-                "human",
-                "--output_path",
-                str(output_dir / f"mask_human_{cam_idx}.png"),
-                "--exclude_mask_path",
-                str(output_dir / f"mask_{cam_idx}.png"),
-            ],
-        )
+        if generate_human_masks:
+            run_python_script(
+                Path("data_process/segment_util_image.py"),
+                [
+                    "--img_path",
+                    str(output_dir / f"{cam_idx}.png"),
+                    "--TEXT_PROMPT",
+                    "human",
+                    "--output_path",
+                    str(output_dir / f"mask_human_{cam_idx}.png"),
+                    "--exclude_mask_path",
+                    str(output_dir / f"mask_{cam_idx}.png"),
+                ],
+            )
+        else:
+            human_mask_root = case_dir.parent.parent / "different_types_human_mask"
+            human_case_root = human_mask_root / case_dir.name / "mask"
+            mask_id: str | None = None
+            mask_info_path = human_case_root / f"mask_info_{cam_idx}.json"
+            if mask_info_path.exists():
+                with mask_info_path.open("r", encoding="utf-8") as f:
+                    mask_info = json.load(f)
+                for key, value in mask_info.items():
+                    if value.lower() == "human":
+                        mask_id = key
+                        break
+            if mask_id is None:
+                candidate_root = human_case_root / str(cam_idx)
+                if candidate_root.exists():
+                    for candidate_dir in sorted(candidate_root.iterdir()):
+                        candidate_path = candidate_dir / f"{frame_str}.png"
+                        if candidate_path.exists():
+                            mask_id = candidate_dir.name
+                            break
+            if mask_id is not None:
+                src_mask_path = (
+                    human_case_root / str(cam_idx) / str(mask_id) / f"{frame_str}.png"
+                )
+                if src_mask_path.exists():
+                    shutil.copy2(
+                        src_mask_path, output_dir / f"mask_human_{cam_idx}.png"
+                    )
+                else:
+                    logging.warning(
+                        "Human mask source missing at %s; regenerating via SAM2.",
+                        src_mask_path,
+                    )
+                    run_python_script(
+                        Path("data_process/segment_util_image.py"),
+                        [
+                            "--img_path",
+                            str(output_dir / f"{cam_idx}.png"),
+                            "--TEXT_PROMPT",
+                            "human",
+                            "--output_path",
+                            str(output_dir / f"mask_human_{cam_idx}.png"),
+                            "--exclude_mask_path",
+                            str(output_dir / f"mask_{cam_idx}.png"),
+                        ],
+                    )
+            else:
+                logging.warning(
+                    "Human mask metadata not found for case %s camera %d; regenerating.",
+                    case_dir.name,
+                    cam_idx,
+                )
+                run_python_script(
+                    Path("data_process/segment_util_image.py"),
+                    [
+                        "--img_path",
+                        str(output_dir / f"{cam_idx}.png"),
+                        "--TEXT_PROMPT",
+                        "human",
+                        "--output_path",
+                        str(output_dir / f"mask_human_{cam_idx}.png"),
+                        "--exclude_mask_path",
+                        str(output_dir / f"mask_{cam_idx}.png"),
+                    ],
+                )
         if generate_high_png:
             run_python_script(
                 Path("data_process/segment_util_image.py"),
@@ -268,6 +335,7 @@ def process_case_frame(
     shape_prior: str,
     frame_idx: int,
     generate_high_png: bool,
+    regenerate_human_masks: bool = False,
 ) -> None:
     """Export Gaussian assets for one case and frame index."""
 
@@ -280,7 +348,14 @@ def process_case_frame(
     output_dir = output_path / case_name  # Match legacy layout (no frame subdirectory).
     ensure_dir(output_dir)
 
-    copy_frame_assets(case_dir, output_dir, frame_idx, category, generate_high_png)
+    copy_frame_assets(
+        case_dir,
+        output_dir,
+        frame_idx,
+        category,
+        generate_high_png,
+        regenerate_human_masks,
+    )
     save_camera_meta(case_dir, output_dir)
     maybe_copy_shape_prior(case_dir, output_dir, shape_prior.lower() == "true")
     save_observation_point_cloud(case_dir, output_dir, frame_idx)
@@ -353,6 +428,12 @@ def main() -> None:
         default=True,
         help="Toggle generation of *_high.png assets (default: enabled).",
     )
+    parser.add_argument(
+        "--regenerate_human_masks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Regenerate human masks even if they already exist (default: disabled).",
+    )
     args = parser.parse_args()
 
     case_name = args.case
@@ -376,6 +457,7 @@ def main() -> None:
         shape_prior,
         frame_idx,
         args.generate_high_png,
+        args.regenerate_human_masks,
     )
 
 

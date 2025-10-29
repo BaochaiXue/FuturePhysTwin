@@ -8,14 +8,16 @@ mkdir -p logs
 python script_process_data.py \
   > >(tee logs/script_process_data.out) \
   2> >(tee logs/script_process_data.err >&2)
+  
+python export_video_human_mask.py \
+  > >(tee logs/export_video_human_mask.out) \
+  2> >(tee logs/export_video_human_mask.err >&2)
 
 python dynamic_export_gs_data.py \
   > >(tee logs/dynamic_export_gs_data.out) \
   2> >(tee logs/dynamic_export_gs_data.err >&2)
 
-python export_video_human_mask.py \
-  > >(tee logs/export_video_human_mask.out) \
-  2> >(tee logs/export_video_human_mask.err >&2)
+
 
 # --- Optimization Steps ---
 # Zero-order Optimization

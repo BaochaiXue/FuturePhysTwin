@@ -18,6 +18,7 @@ import json
 import pickle
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -33,17 +34,27 @@ def ensure_dir(path: Path) -> None:
 
 
 ensure_dir(output_path)
-# generate interp_poses.pkl
-print(f"[info] Generating interp_poses.pkl")
-subprocess.run(
-    [
-        "python",
-        "./gaussian_splatting/generate_interp_poses.py",
-        "--root_dir",
-        str(output_path),
-    ],
-    check=True,
-)
+
+
+def run_with_retry(cmd: list[str], attempts: int = 5, delay: float = 2.0) -> None:
+    """
+    Execute ``cmd`` with retries to mitigate sporadic crashes (e.g., segmentation faults).
+    """
+
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            if attempt == attempts:
+                raise
+            cmd_str = " ".join(str(part) for part in cmd)
+            print(
+                f"[warn] Command failed (attempt {attempt}/{attempts}): {cmd_str}\n"
+                f"       Retrying after {delay:.1f}s..."
+            )
+            time.sleep(delay)
+
 
 with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
     reader = csv.reader(csvfile)
@@ -80,7 +91,7 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
             mask_path = case_dir / "mask" / str(i) / str(obj_idx) / "0.png"
             shutil.copy2(mask_path, dest_case_dir / f"mask_{i}.png")
             # Prepare the high-resolution image
-            subprocess.run(
+            run_with_retry(
                 [
                     "python",
                     "./data_process/image_upscale.py",
@@ -90,11 +101,10 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                     str(dest_case_dir / f"{i}_high.png"),
                     "--category",
                     category,
-                ],
-                check=True,
+                ]
             )
             # Prepare the segmentation mask of the high-resolution image
-            subprocess.run(
+            run_with_retry(
                 [
                     "python",
                     "./data_process/segment_util_image.py",
@@ -104,8 +114,7 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                     category,
                     "--output_path",
                     str(dest_case_dir / f"mask_{i}_high.png"),
-                ],
-                check=True,
+                ]
             )
 
             # Copy the original depth image
@@ -115,7 +124,7 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
             )
 
             # Prepare the human mask for the low-resolution image and high-resolution image
-            subprocess.run(
+            run_with_retry(
                 [
                     "python",
                     "./data_process/segment_util_image.py",
@@ -127,10 +136,9 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                     str(dest_case_dir / f"mask_human_{i}.png"),
                     "--exclude_mask_path",
                     str(dest_case_dir / f"mask_{i}.png"),
-                ],
-                check=True,
+                ]
             )
-            subprocess.run(
+            run_with_retry(
                 [
                     "python",
                     "./data_process/segment_util_image.py",
@@ -142,8 +150,7 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                     str(dest_case_dir / f"mask_human_{i}_high.png"),
                     "--exclude_mask_path",
                     str(dest_case_dir / f"mask_{i}_high.png"),
-                ],
-                check=True,
+                ]
             )
 
         # Prepare the intrinsic and extrinsic parameters
@@ -187,3 +194,14 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
         # coordinate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
         # o3d.visualization.draw_geometries([pcd, coordinate])
         o3d.io.write_point_cloud(str(dest_case_dir / "observation.ply"), pcd)
+
+# generate interp_poses.pkl after all assets are copied
+print(f"[info] Generating interp_poses.pkl")
+run_with_retry(
+    [
+        "python",
+        "./gaussian_splatting/generate_interp_poses.py",
+        "--root_dir",
+        str(output_path),
+    ]
+)

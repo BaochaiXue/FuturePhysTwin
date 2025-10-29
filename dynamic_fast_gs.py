@@ -307,7 +307,7 @@ def main() -> None:
             "--model_path",
             str(model_dir),
             "--iterations",
-            str(args.iterations * frame_count.get(scene_name, 1) // 10),
+            str(args.iterations * frame_count.get(scene_name, 1) // 20),
             "--use_masks",
         ]
         color_command.extend(["--frames_dir", str(data_dir)])
