@@ -712,12 +712,16 @@ class GaussianModel:
 
     def get_xyz_canonical(self) -> torch.Tensor:
         if self._xyz0 is None:
-            raise RuntimeError("Canonical xyz not initialised. Call snapshot_canonical_pose() first.")
+            raise RuntimeError(
+                "Canonical xyz not initialised. Call snapshot_canonical_pose() first."
+            )
         return self._xyz0
 
     def get_rotation_canonical(self) -> torch.Tensor:
         if self._rotation0 is None:
-            raise RuntimeError("Canonical rotation not initialised. Call snapshot_canonical_pose() first.")
+            raise RuntimeError(
+                "Canonical rotation not initialised. Call snapshot_canonical_pose() first."
+            )
         return self._rotation0
 
     def freeze_geometry(self) -> None:
@@ -746,7 +750,7 @@ class GaussianModel:
             yield
         finally:
             self._xyz.copy_(xyz_bak)
-            self._rotation.copy_(rot_bak)
+            self._rotation.copy_(rot_bak)  # ？
 
     # def add_densification_stats(self, viewspace_point_tensor, update_filter):
     #     self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

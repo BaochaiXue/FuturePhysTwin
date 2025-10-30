@@ -6,7 +6,7 @@ Inputs
 ------
 - Frame-level Gaussian data at ``./per_frame_gaussian_data/<frame>/<scene>/`` (override via ``--data_dir``) containing RGB, depth, masks, ``camera_meta.pkl``, ``observation.ply``, and optional ``shape_prior.glb``.
 - Helper scripts: ``generate_interp_poses.py``, ``dynamic_fast_canonical.py``, ``gs_render.py``, ``img2video.py``.
-- Optional motion references (``experiments/<scene>/inference.pkl``, ``data/different_types/<scene>/track_process_data.pkl``). When present they are copied next to the canonical checkpoint and ``prepare_lbs_weights.py`` is invoked to produce ``lbs_data.pt``. Stage B (`dynamic_fast_color.py`) then scans ``per_frame_gaussian_data/*/<scene>/`` via ``--frames_dir`` to aggregate all frame-specific cameras.
+- Optional motion references (``experiments/<scene>/inference.pkl``, ``data/different_types/<scene>/track_process_data.pkl``). When present they are copied next to the canonical checkpoint and ``precompute_lbs_pose_cache.py`` is invoked to produce ``lbs_pose_cache.pt``. Stage B (`dynamic_fast_color.py`) then scans ``per_frame_gaussian_data/*/<scene>/`` via ``--frames_dir`` to aggregate all frame-specific cameras.
 
 Outputs
 -------
@@ -286,23 +286,24 @@ def main() -> None:
                 print(f"[LBS] Warning: {src_path} not found; skipping copy.")
 
         motion_source = lbs_dir / "inference.pkl"
+        pose_cache_path = model_dir / "lbs_pose_cache.pt"
         if motion_source.is_file():
-            lbs_command: list[str] = [
+            precompute_command: list[str] = [
                 "python",
-                str(root / "prepare_lbs_weights.py"),
+                str(root / "precompute_lbs_pose_cache.py"),
                 "--model_dir",
                 str(model_dir),
-                "--motion_source",
+                "--inference",
                 str(motion_source),
-                "--k_bones",
-                "64",
-                "--k_skin",
-                "8",
+                "--output",
+                str(pose_cache_path),
+                "--K",
+                "16",
             ]
-            run_command(lbs_command)
+            run_command(precompute_command)
         else:
             print(
-                f"[LBS] Warning: {motion_source} missing; skip LBS metadata generation."
+                f"[LBS] Warning: {motion_source} missing; skip offline pose cache generation."
             )
 
         color_command: list[str] = [
@@ -310,16 +311,21 @@ def main() -> None:
             str(root / "dynamic_fast_color.py"),
             "--color_only",
             "--freeze_geometry",
-            "--lbs_path",
-            str(model_dir / "lbs_data.pt"),
             "--source_path",
             str(scene_dir),
             "--model_path",
             str(model_dir),
             "--iterations",
-            str(args.iterations * frame_count.get(scene_name, 1) // 20),
+            str(args.iterations * frame_count.get(scene_name, 1) // 10),
             "--use_masks",
         ]
+        if pose_cache_path.exists():
+            color_command.extend(["--lbs_pose_cache", str(pose_cache_path)])
+        else:
+            print(
+                f"[LBS] Warning: offline pose cache missing at {pose_cache_path}; "
+                "colour stage will run without pose deformation."
+            )
         color_command.extend(["--frames_dir", str(data_dir)])
         run_command(color_command)
         final_models.append((scene_dir, scene_name, model_dir / "color_refine"))

@@ -7,7 +7,10 @@ Inputs
 ------
 - Canonical frame data at ``ModelParams.source_path`` (Stage A frame) plus every additional frame directory discovered via ``--frames_dir`` (e.g. ``per_frame_gaussian_data/<frame>/<scene>/``), providing per-frame RGB, depth, masks, ``camera_meta.pkl``, and ``observation.ply``.
 - Canonical Gaussian checkpoint ``<model_path>/canonical_gaussians.npz`` (fallback) or ``color_refine/canonical_gaussians_color.npz`` when resuming a previous colour run; this supplies the shared Gaussian kernels (xyz/scaling/rotation/SH/opacity).
-- Optional LBS bundle ``<model_path>/lbs_data.pt`` with bone anchors, adjacency graph, skin indices/weights, and per-frame bone motions used to deform the canonical kernels to each video frame.
+- Optional offline pose cache ``<model_path>/lbs_pose_cache.pt`` produced by
+  ``precompute_lbs_pose_cache.py``. When unavailable the legacy ``lbs_data.pt``
+  bundle (containing bones/weights/motions) can still be used as a fallback for
+  online LBS deformation.
 
 Outputs
 -------
@@ -15,7 +18,9 @@ Outputs
 - ``exposure.json`` and TensorBoard logs (when enabled), likewise written to ``color_refine`` for colour runs.
 - Refined appearance parameters saved to ``<model_path>/color_refine/canonical_gaussians_color.npz``, preserving the original canonical checkpoint.
 """
-
+# TODO: Gaussian xyz 有没有回复到 LBS 变形前的结果？
+# 直接存储 Gaussian Kernel LBS后xyz rot
+# 重新梳理一下代码结构和注释
 import os
 import sys
 import uuid
@@ -25,13 +30,13 @@ from pathlib import Path
 from random import randint
 from typing import Any, Optional, Sequence, TYPE_CHECKING
 
-import numpy as np
 import torch
 from gaussian_splatting.arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_splatting.gaussian_renderer import render, network_gui
 from gaussian_splatting.skinning import LBSDeformer
 from gaussian_splatting.scene import GaussianModel, Scene
 from gaussian_splatting.scene.dataset_readers import readQQTTSceneInfo
+from gaussian_splatting.utils.canonical_io import dump_gaussian_npz, load_canonical_npz
 from gaussian_splatting.utils.camera_utils import cameraList_from_camInfos
 from gaussian_splatting.utils.general_utils import get_expon_lr_func, safe_state
 from gaussian_splatting.utils.image_utils import psnr  # noqa: F401  # kept for parity
@@ -57,6 +62,7 @@ try:
 except ImportError:
     SummaryWriter = None  # type: ignore[assignment]
     TENSORBOARD_FOUND = False
+    print("[warn] TensorBoard not available; training logs will not be recorded.")
 
 try:
     # Differentiable SSIM kernel; gracefully falls back to PyTorch version.
@@ -66,6 +72,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     fused_ssim = None  # type: ignore[assignment]
     FUSED_SSIM_AVAILABLE = False
+    print(
+        "[warn] fused_ssim not available; falling back to standard PyTorch SSIM implementation."
+    )
 
 try:
     # CUDA accelerated optimiser for sparse Gaussian updates.
@@ -75,25 +84,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     SparseGaussianAdam = None  # type: ignore[assignment]
     SPARSE_ADAM_AVAILABLE = False
-
-
-def load_canonical_npz(path: Path) -> dict[str, torch.Tensor]:
-    if not path.exists():
-        raise FileNotFoundError(f"Canonical parameters not found: {path}")
-    data = np.load(path)
-    tensors = {}
-    device = torch.device("cuda")
-    tensors["xyz"] = torch.from_numpy(data["xyz"]).float().to(device)
-    tensors["scaling"] = torch.from_numpy(data["scaling"]).float().to(device)
-    tensors["rotation"] = torch.from_numpy(data["rotation"]).float().to(device)
-    tensors["features_dc"] = torch.from_numpy(data["features_dc"]).float().to(device)
-    tensors["features_rest"] = (
-        torch.from_numpy(data["features_rest"]).float().to(device)
+    print(
+        "[warn] SparseGaussianAdam not available; falling back to standard Adam optimiser."
     )
-    tensors["opacity"] = torch.from_numpy(data["opacity"]).float().to(device)
-    tensors["active_sh_degree"] = int(data["active_sh_degree"][0])
-    tensors["max_sh_degree"] = int(data["max_sh_degree"][0])
-    return tensors
 
 
 def load_lbs_data(path: Path) -> dict[str, torch.Tensor]:
@@ -138,22 +131,6 @@ def assign_canonical_parameters(
     gaussians.snapshot_canonical_pose()
 
 
-def dump_color_parameters(gaussians: GaussianModel, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with torch.no_grad():
-        payload = {
-            "xyz": gaussians.get_xyz.detach().cpu().numpy(),
-            "scaling": gaussians.get_scaling.detach().cpu().numpy(),
-            "rotation": gaussians.get_rotation.detach().cpu().numpy(),
-            "features_dc": gaussians.get_features_dc.detach().cpu().numpy(),
-            "features_rest": gaussians.get_features_rest.detach().cpu().numpy(),
-            "opacity": gaussians.get_opacity.detach().cpu().numpy(),
-            "active_sh_degree": np.array([gaussians.active_sh_degree], dtype=np.int32),
-            "max_sh_degree": np.array([gaussians.max_sh_degree], dtype=np.int32),
-        }
-    np.savez(output_path, **payload)
-
-
 def training(
     dataset: ModelParams,
     opt: OptimizationParams,
@@ -168,6 +145,7 @@ def training(
     freeze_geometry: bool = False,
     lbs_path: Optional[Path] = None,
     frames_dir: Optional[Path] = None,
+    lbs_pose_cache: Optional[Path] = None,
 ) -> None:
     """
     Run the full Gaussian optimisation loop for a preprocessed QQTT scene.
@@ -188,6 +166,7 @@ def training(
 
     lbs_deformer: Optional[LBSDeformer] = None
     lbs_motions: Optional[torch.Tensor] = None
+    pose_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
 
     first_iter: int = 0
     # Create the output folder structure and, if available, a TensorBoard writer.
@@ -209,6 +188,8 @@ def training(
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
+    should_freeze_geometry = color_only or freeze_geometry
+
     if color_only:
         canonical_color_path = (
             canonical_dir / "color_refine" / "canonical_gaussians_color.npz"
@@ -229,7 +210,7 @@ def training(
         )
         canonical_data = load_canonical_npz(canonical_path)
         assign_canonical_parameters(gaussians, canonical_data)
-        if freeze_geometry:
+        if should_freeze_geometry:
             gaussians.freeze_geometry()
         feature_lr = opt.feature_lr
         rest_lr = opt.feature_lr / 20.0
@@ -246,7 +227,25 @@ def training(
         gaussians.exposure_optimizer = torch.optim.Adam(
             [{"params": [gaussians._exposure], "name": "exposure"}]
         )
-        if lbs_path is not None:
+        if lbs_pose_cache is not None:
+            cache_payload = torch.load(lbs_pose_cache, map_location="cpu")
+            cache_dict = cache_payload.get("pose_cache")
+            if cache_dict is None:
+                raise KeyError(
+                    f"{lbs_pose_cache} does not contain a 'pose_cache' entry."
+                )
+            pose_cache = {
+                int(frame_id): (
+                    entry["xyz"].to("cuda").float(),
+                    entry["quat"].to("cuda").float(),
+                )
+                for frame_id, entry in cache_dict.items()
+            }
+            print(
+                f"[LBS] Loaded offline pose cache with {len(pose_cache)} frames "
+                f"from {lbs_pose_cache}"
+            )
+        elif lbs_path is not None:
             lbs_payload = load_lbs_data(lbs_path)
             lbs_deformer = LBSDeformer(
                 lbs_payload["bones0"],
@@ -257,8 +256,11 @@ def training(
             lbs_motions = lbs_payload["motions"]
         else:
             print(
-                "[LBS] Warning: --lbs_path not provided; colour stage will run without pose deformation."
+                "[LBS] Warning: neither --lbs_pose_cache nor --lbs_path provided; "
+                "colour optimisation will run without pose deformation."
             )
+    elif should_freeze_geometry:
+        gaussians.freeze_geometry()
 
     use_sparse_adam = (
         not color_only and opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
@@ -399,7 +401,16 @@ def training(
         # Use either random backgrounds (for regularisation) or the configured constant.
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if (
+        if color_only and pose_cache is not None:
+            posed = pose_cache.get(int(frame_id))
+            if posed is None:
+                raise KeyError(
+                    f"Frame {frame_id} not found in offline LBS cache "
+                    f"({len(pose_cache)} cached frames). Ensure indices align."
+                )
+            posed_xyz, posed_rot = posed
+            pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
+        elif (
             color_only
             and lbs_deformer is not None
             and lbs_motions is not None
@@ -414,9 +425,6 @@ def training(
             pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
         else:
             pose_ctx = nullcontext()
-            print(
-                f"[LBS] Warning: skipping LBS deformation for frame {frame_id} in the case of "
-            )
 
         with pose_ctx:
             if dataset.disable_sh:
@@ -617,7 +625,7 @@ def training(
 
     if color_only:
         color_path = canonical_dir / "color_refine" / "canonical_gaussians_color.npz"
-        dump_color_parameters(gaussians, color_path)
+        dump_gaussian_npz(gaussians, color_path)
         print(f"Colour parameters saved to {color_path}")
 
 
@@ -706,6 +714,12 @@ def main() -> None:
         default=None,
         help="Optional root containing per-frame data (reserved for future use).",
     )
+    parser.add_argument(
+        "--lbs_pose_cache",
+        type=Path,
+        default=None,
+        help="Path to offline LBS cache (.pt) produced by precompute_lbs_pose_cache.py.",
+    )
     args = parser.parse_args(sys.argv[1:])
     # Always capture the terminal iteration so the final state is stored on disk.
     args.save_iterations.append(args.iterations)
@@ -733,6 +747,7 @@ def main() -> None:
         freeze_geometry=args.freeze_geometry,
         lbs_path=args.lbs_path,
         frames_dir=args.frames_dir,
+        lbs_pose_cache=args.lbs_pose_cache,
     )
 
     print("\nTraining complete.")

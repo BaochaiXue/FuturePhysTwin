@@ -26,14 +26,15 @@ import os
 import sys
 import uuid
 from argparse import ArgumentParser, Namespace
+from pathlib import Path
 from random import randint
 from typing import Any, Optional, Sequence, TYPE_CHECKING
 
 import torch
-import numpy as np
 from gaussian_splatting.arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_splatting.gaussian_renderer import render, network_gui
 from gaussian_splatting.scene import GaussianModel, Scene
+from gaussian_splatting.utils.canonical_io import dump_gaussian_npz
 from gaussian_splatting.utils.general_utils import get_expon_lr_func, safe_state
 from gaussian_splatting.utils.image_utils import psnr  # noqa: F401  # kept for parity
 from gaussian_splatting.utils.loss_utils import (
@@ -76,28 +77,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     SparseGaussianAdam = None  # type: ignore[assignment]
     SPARSE_ADAM_AVAILABLE = False
-
-
-def dump_canonical_parameters(gaussians: GaussianModel, output_path: str) -> None:
-    """
-    Serialize the canonical Gaussian parameters needed for downstream LBS/colour stages.
-    """
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with torch.no_grad():
-        canonical = {
-            "xyz": gaussians.get_xyz.detach().cpu().numpy(),
-            "scaling": gaussians.get_scaling.detach().cpu().numpy(),
-            "rotation": gaussians.get_rotation.detach().cpu().numpy(),
-            "features_dc": gaussians.get_features_dc.detach().cpu().numpy(),
-            "features_rest": gaussians.get_features_rest.detach().cpu().numpy(),
-            "opacity": gaussians.get_opacity.detach().cpu().numpy(),
-            "active_sh_degree": np.array(
-                [gaussians.active_sh_degree], dtype=np.int32
-            ),
-            "max_sh_degree": np.array([gaussians.max_sh_degree], dtype=np.int32),
-        }
-    np.savez(output_path, **canonical)
 
 
 def training(
@@ -417,7 +396,7 @@ def training(
                 )
 
     canonical_path = os.path.join(dataset.model_path, "canonical_gaussians.npz")
-    dump_canonical_parameters(gaussians, canonical_path)
+    dump_gaussian_npz(gaussians, Path(canonical_path))
     print(f"Canonical parameters saved to {canonical_path}")
 
 

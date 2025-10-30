@@ -40,7 +40,7 @@ python dynamic_fast_gs.py \
   > >(tee logs/dynamic_fast_gs.out) \
   2> >(tee logs/dynamic_fast_gs.err >&2)
 # --- Simulation & Rendering Evaluation ---
-bash gs_run_simulate.sh \
+python gs_run_simulate.py \
   > >(tee logs/gs_run_simulate.out) \
   2> >(tee logs/gs_run_simulate.err >&2)
 
@@ -48,11 +48,11 @@ python export_render_eval_data.py \
   > >(tee logs/export_render_eval_data.out) \
   2> >(tee logs/export_render_eval_data.err >&2)
 
-bash evaluate.sh \
+python evaluate.py \
   > >(tee logs/evaluate.out) \
   2> >(tee logs/evaluate.err >&2)
 
-bash gs_run_simulate_white.sh \
+python gs_run_simulate_white.py \
   > >(tee logs/gs_run_simulate_white.out) \
   2> >(tee logs/gs_run_simulate_white.err >&2)
 
