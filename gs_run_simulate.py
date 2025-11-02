@@ -18,15 +18,9 @@ from __future__ import annotations
 
 import subprocess
 import time
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Iterable, Sequence
-
-
-OUTPUT_DIR = Path("gaussian_output_dynamic")
-VIEWS: Sequence[str] = ("0", "1", "2")
-EXP_NAME = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
-DATA_ROOT = Path("./data/gaussian_data")
-GAUSSIAN_ROOT = Path("./gaussian_output")
 
 
 def run_command(
@@ -47,7 +41,6 @@ def run_command(
             subprocess.run(list(command), check=True)
             return
         except subprocess.CalledProcessError as exc:
-            time.sleep(sleep_time)
             attempts += 1
             if attempts >= retries:
                 raise
@@ -68,11 +61,55 @@ def iter_scene_dirs(root: Path) -> Iterable[Path]:
             yield scene_dir
 
 
+def parse_args() -> Namespace:
+    parser = ArgumentParser(
+        description="Render dynamic views for every scene and export videos."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=Path("gaussian_output_dynamic"),
+        help="Destination directory for rendered frames and videos.",
+    )
+    parser.add_argument(
+        "--views",
+        nargs="+",
+        default=("0", "1", "2"),
+        help="List of view identifiers to convert into videos.",
+    )
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0",
+        help="Experiment name used when locating canonical checkpoints.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=Path,
+        default=Path("./data/gaussian_data"),
+        help="Root directory containing per-scene Gaussian-ready assets.",
+    )
+    parser.add_argument(
+        "--gaussian_root",
+        type=Path,
+        default=Path("./gaussian_output"),
+        help="Root directory containing canonical Gaussian checkpoints.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for scene_dir in iter_scene_dirs(DATA_ROOT):
+    args = parse_args()
+    output_dir: Path = args.output_dir
+    views: Sequence[str] = tuple(args.views)
+    exp_name: str = args.exp_name
+    data_root: Path = args.data_root
+    gaussian_root: Path = args.gaussian_root
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for scene_dir in iter_scene_dirs(data_root):
         scene_name = scene_dir.name
-        model_dir = GAUSSIAN_ROOT / scene_name / EXP_NAME
+        model_dir = gaussian_root / scene_name / exp_name
         if not model_dir.exists():
             print(f"[Skip] Canonical output missing for {scene_name}: {model_dir}")
             continue
@@ -87,15 +124,17 @@ def main() -> None:
                 str(model_dir),
                 "--name",
                 scene_name,
+                "--output_dir",
+                str(output_dir),
             ]
         )
 
-        for view_name in VIEWS:
-            image_folder = OUTPUT_DIR / scene_name / view_name
+        for view_name in views:
+            image_folder = output_dir / scene_name / view_name
             if not image_folder.exists():
                 print(f"[Skip] Render folder missing for {scene_name}/{view_name}")
                 continue
-            video_path = OUTPUT_DIR / scene_name / f"{view_name}.mp4"
+            video_path = output_dir / scene_name / f"{view_name}.mp4"
             video_path.parent.mkdir(parents=True, exist_ok=True)
             run_command(
                 [

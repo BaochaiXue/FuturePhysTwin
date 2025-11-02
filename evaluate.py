@@ -21,10 +21,51 @@ from pathlib import Path
 from typing import Sequence
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+RESULTS_DIR = PROJECT_ROOT / "results"
+DEFAULT_PREDICTION_DIR = PROJECT_ROOT / "experiments"
+DEFAULT_BASE_PATH = PROJECT_ROOT / "data/different_types"
+DEFAULT_RENDER_PATH = PROJECT_ROOT / "data/render_eval_data"
+DEFAULT_HUMAN_MASK_PATH = PROJECT_ROOT / "data/different_types_human_mask"
+DEFAULT_GAUSSIAN_DATA_ROOT = PROJECT_ROOT / "data/gaussian_data"
+DEFAULT_GAUSSIAN_OUTPUT_DIR = PROJECT_ROOT / "gaussian_output_dynamic"
+
+
 EVAL_COMMANDS: Sequence[Sequence[str]] = (
-    ("python", "evaluate_chamfer.py"),
-    ("python", "evaluate_track.py"),
-    ("python", "gaussian_splatting/evaluate_render.py"),
+    (
+        "python",
+        "evaluate_chamfer.py",
+        "--prediction_dir",
+        str(DEFAULT_PREDICTION_DIR),
+        "--base_path",
+        str(DEFAULT_BASE_PATH),
+        "--output_file",
+        str(RESULTS_DIR / "final_results.csv"),
+    ),
+    (
+        "python",
+        "evaluate_track.py",
+        "--prediction_path",
+        str(DEFAULT_PREDICTION_DIR),
+        "--base_path",
+        str(DEFAULT_BASE_PATH),
+        "--output_file",
+        str(RESULTS_DIR / "final_track.csv"),
+    ),
+    (
+        "python",
+        "gaussian_splatting/evaluate_render.py",
+        "--render_path",
+        str(DEFAULT_RENDER_PATH),
+        "--human_mask_path",
+        str(DEFAULT_HUMAN_MASK_PATH),
+        "--root_data_dir",
+        str(DEFAULT_GAUSSIAN_DATA_ROOT),
+        "--output_dir",
+        str(DEFAULT_GAUSSIAN_OUTPUT_DIR),
+        "--log_dir",
+        str(RESULTS_DIR),
+    ),
 )
 
 
@@ -57,7 +98,7 @@ def run_command(
 
 
 def main() -> None:
-    results_dir = Path("results")
+    results_dir = RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
     for command in EVAL_COMMANDS:
         run_command(command)
