@@ -1,13 +1,36 @@
-import pickle
-import glob
+import os
 import csv
 import json
+import glob
+import pickle
 import numpy as np
 from scipy.spatial import KDTree
+from argparse import ArgumentParser, Namespace
 
-base_path = "./data/different_types"
-prediction_path = "experiments"
-output_file = "results/final_track.csv"
+
+def parse_args() -> Namespace:
+    parser = ArgumentParser(
+        description="Evaluate tracking accuracy for predicted trajectories."
+    )
+    parser.add_argument(
+        "--base_path",
+        type=str,
+        default="./data/different_types",
+        help="Directory containing ground-truth tracking data (default: ./data/different_types).",
+    )
+    parser.add_argument(
+        "--prediction_path",
+        type=str,
+        default="experiments",
+        help="Directory containing predicted trajectories (default: experiments).",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="results/final_track.csv",
+        help="CSV file to store evaluation results (default: results/final_track.csv).",
+    )
+    return parser.parse_args()
 
 
 def evaluate_prediction(start_frame, end_frame, vertices, gt_track_3d, idx, mask):
@@ -21,51 +44,59 @@ def evaluate_prediction(start_frame, end_frame, vertices, gt_track_3d, idx, mask
             track_error = 0
         else:
             track_error = np.mean(np.linalg.norm(pred_x - gt_track_points, axis=1))
-        
+
         track_errors.append(track_error)
     return np.mean(track_errors)
 
 
-file = open(output_file, mode="w", newline="", encoding="utf-8")
-writer = csv.writer(file)
-writer.writerow(
-    [
-        "Case Name",
-        "Train Track Error",
-        "Test Track Error",
-    ]
-)
+if __name__ == "__main__":
+    args = parse_args()
+    base_path = args.base_path
+    prediction_path = args.prediction_path
+    output_file = args.output_file
 
-dir_names = glob.glob(f"{base_path}/*")
-for dir_name in dir_names:
-    case_name = dir_name.split("/")[-1]
-    # if case_name != "single_lift_dinosor":
-    #     continue
-    print(f"Processing {case_name}!!!!!!!!!!!!!!!")
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
 
-    with open(f"{base_path}/{case_name}/split.json", "r") as f:
-        split = json.load(f)
-    frame_len = split["frame_len"]
-    train_frame = split["train"][1]
-    test_frame = split["test"][1]
-
-    with open(f"{prediction_path}/{case_name}/inference.pkl", "rb") as f:
-        vertices = pickle.load(f)
-
-    with open(f"{base_path}/{case_name}/gt_track_3d.pkl", "rb") as f:
-        gt_track_3d = pickle.load(f)
-
-    # Locate the index of corresponding point index in the vertices, if nan, then ignore the points
-    mask = ~np.isnan(gt_track_3d[0]).any(axis=1)
-
-    kdtree = KDTree(vertices[0])
-    dis, idx = kdtree.query(gt_track_3d[0][mask])
-
-    train_track_error = evaluate_prediction(
-        1, train_frame, vertices, gt_track_3d, idx, mask
+    file = open(output_file, mode="w", newline="", encoding="utf-8")
+    writer = csv.writer(file)
+    writer.writerow(
+        [
+            "Case Name",
+            "Train Track Error",
+            "Test Track Error",
+        ]
     )
-    test_track_error = evaluate_prediction(
-        train_frame, test_frame, vertices, gt_track_3d, idx, mask
-    )
-    writer.writerow([case_name, train_track_error, test_track_error])
-file.close()
+
+    dir_names = glob.glob(f"{base_path}/*")
+    for dir_name in dir_names:
+        case_name = dir_name.split("/")[-1]
+        # if case_name != "single_lift_dinosor":
+        #     continue
+        print(f"Processing {case_name}!!!!!!!!!!!!!!!")
+
+        with open(f"{base_path}/{case_name}/split.json", "r") as f:
+            split = json.load(f)
+        frame_len = split["frame_len"]
+        train_frame = split["train"][1]
+        test_frame = split["test"][1]
+
+        with open(f"{prediction_path}/{case_name}/inference.pkl", "rb") as f:
+            vertices = pickle.load(f)
+
+        with open(f"{base_path}/{case_name}/gt_track_3d.pkl", "rb") as f:
+            gt_track_3d = pickle.load(f)
+
+        # Locate the index of corresponding point index in the vertices, if nan, then ignore the points
+        mask = ~np.isnan(gt_track_3d[0]).any(axis=1)
+
+        kdtree = KDTree(vertices[0])
+        dis, idx = kdtree.query(gt_track_3d[0][mask])
+
+        train_track_error = evaluate_prediction(
+            1, train_frame, vertices, gt_track_3d, idx, mask
+        )
+        test_track_error = evaluate_prediction(
+            train_frame, test_frame, vertices, gt_track_3d, idx, mask
+        )
+        writer.writerow([case_name, train_track_error, test_track_error])
+    file.close()

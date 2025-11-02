@@ -1,18 +1,35 @@
-import glob
-import pickle
-import json
-import torch
 import csv
-import numpy as np
 import os
+import glob
+import json
+import pickle
+import numpy as np
+import torch
+from argparse import ArgumentParser, Namespace
 from pytorch3d.loss import chamfer_distance
 
-prediction_dir = "./experiments"
-base_path = "./data/different_types"
-output_file = "results/final_results.csv"
 
-if not os.path.exists("results"):
-    os.makedirs("results")
+def parse_args() -> Namespace:
+    parser = ArgumentParser(description="Evaluate Chamfer distance for tracked trajectories.")
+    parser.add_argument(
+        "--prediction_dir",
+        type=str,
+        default="./experiments",
+        help="Directory containing predicted trajectories (default: ./experiments).",
+    )
+    parser.add_argument(
+        "--base_path",
+        type=str,
+        default="./data/different_types",
+        help="Directory with ground-truth data (default: ./data/different_types).",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="results/final_results.csv",
+        help="CSV file to write evaluation results (default: results/final_results.csv).",
+    )
+    return parser.parse_args()
 
 def evaluate_prediction(
     start_frame,
@@ -66,6 +83,13 @@ def evaluate_prediction(
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    prediction_dir = args.prediction_dir
+    base_path = args.base_path
+    output_file = args.output_file
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+
     file = open(output_file, mode="w", newline="", encoding="utf-8")
     writer = csv.writer(file)
 
