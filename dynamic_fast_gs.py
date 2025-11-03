@@ -263,6 +263,11 @@ def main() -> None:
         # --------------------------------------------------------------
         # Stage 4: copy motion assets required for downstream LBS.
         # --------------------------------------------------------------
+        colour_dir = model_dir / "color_refine"
+        if colour_dir.exists():
+            print(f"[Cleanup] Removing stale colour-refine directory: {colour_dir}")
+            shutil.rmtree(colour_dir)
+
         lbs_dir = model_dir / "lbs"
         ensure_dir(lbs_dir)
         motion_sources = [
@@ -287,6 +292,9 @@ def main() -> None:
 
         motion_source = lbs_dir / "inference.pkl"
         pose_cache_path = model_dir / "lbs_pose_cache.pt"
+        if pose_cache_path.exists():
+            print(f"[Cleanup] Removing stale pose cache: {pose_cache_path}")
+            pose_cache_path.unlink()
         if motion_source.is_file():
             precompute_command: list[str] = [
                 "python",

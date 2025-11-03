@@ -220,3 +220,7 @@ per_frame_gaussian_output
 tmp_gaussian_output
 tmp_gaussian_output_video
 all_code.md
+tmp_gaussian_output_dynamic_white
+tmp_gaussian_output_dynamic
+tmp_gaussian_output_FIXED
+tmp_results

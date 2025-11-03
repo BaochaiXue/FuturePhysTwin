@@ -648,6 +648,10 @@ def readQQTTSceneInfo(
             mask = np.array(Image.open(mask_path))
             if len(mask.shape) == 3:
                 mask = mask[:, :, -1]  # take the alpha channel
+            print(
+                f"[Mask] camera={cam_i} object mask | shape={mask.shape}, "
+                f"dtype={mask.dtype}, unique={np.unique(mask)[:5]}"
+            )
             image_rgba = np.concatenate([np.array(image), mask[:, :, None]], axis=-1)
             image = Image.fromarray(image_rgba)
 
@@ -684,10 +688,19 @@ def readQQTTSceneInfo(
             if len(occ_mask.shape) == 3:
                 occ_mask = occ_mask[:, :, -1]  # take the alpha channel
             occ_mask = occ_mask.astype(np.float32) / 255.0
+            # output binary mask
+            # print("OCC MASK STATS:")
+            # print(occ_mask.max(), occ_mask.min())
+            # print(occ_mask)
             kernel_size = 8
             occ_mask = cv2.dilate(
                 occ_mask, np.ones((kernel_size, kernel_size), np.uint8), iterations=1
             )  # dilate to avoid boundary artifacts
+            print(
+                f"[Mask] camera={cam_i} human mask | shape={occ_mask.shape}, "
+                f"dtype={occ_mask.dtype}, min={occ_mask.min():.3f}, "
+                f"max={occ_mask.max():.3f}"
+            )
 
         if normal is not None:
             normal = normal.astype(np.float32) / 255.0  # normalize to [0, 1]

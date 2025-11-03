@@ -33,19 +33,17 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
         case_name = row[0]
         category = row[1]
         shape_prior = row[2]
-        
+
         if not os.path.exists(f"{base_path}/{case_name}"):
             continue
         print(f"Processing {case_name}!!!!!!!!!!!!!!!")
-    
+
         # Create the directory for the case
         existDir(f"{output_path}/{case_name}")
         existDir(f"{output_path}/{case_name}/mask")
         for i in range(3):
             # Copy the original RGB image
-            os.system(
-                f"cp -r {base_path}/{case_name}/color {output_path}/{case_name}/"
-            )
+            os.system(f"cp -r {base_path}/{case_name}/color {output_path}/{case_name}/")
             # Copy only the object mask image
             # Get the mask path for the image
             with open(f"{base_path}/{case_name}/mask/mask_info_{i}.json", "r") as f:
@@ -57,7 +55,9 @@ with open("data_config.csv", newline="", encoding="utf-8") as csvfile:
                         raise ValueError("More than one object detected.")
                     obj_idx = int(key)
             existDir(f"{output_path}/{case_name}/mask/{i}")
-            os.system(f"cp -r {base_path}/{case_name}/mask/{i}/{obj_idx}/* {output_path}/{case_name}/mask/{i}/")
-        
+            os.system(
+                f"cp -r {base_path}/{case_name}/mask/{i}/{obj_idx}/* {output_path}/{case_name}/mask/{i}/"
+            )
+
         # Copy the split.json
         os.system(f"cp {base_path}/{case_name}/split.json {output_path}/{case_name}/")

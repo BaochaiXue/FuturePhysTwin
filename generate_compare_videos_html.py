@@ -19,7 +19,7 @@ from typing import Iterable, List
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 OURS_ROOT = SCRIPT_ROOT / "gaussian_output_dynamic_white"
-REFERENCE_ROOT = SCRIPT_ROOT / "../PhysTwin/gaussian_output_dynamic_white"
+REFERENCE_ROOT = SCRIPT_ROOT / "tmp_gaussian_output_dynamic_white"
 OUTPUT_DIR = SCRIPT_ROOT / "compare_visualization"
 DEFAULT_OUTPUT_NAME = "comparison_videos.html"
 CAMERA_VIEWS = ("0", "1", "2")
@@ -61,7 +61,9 @@ def collect_view_pairs(case_dir: Path) -> List[tuple[str, Path, Path]]:
     case_name = case_dir.name
     reference_dir = REFERENCE_ROOT / case_name
     if not reference_dir.exists():
-        LOGGER.warning("Skipping %s: reference case missing (%s)", case_name, reference_dir)
+        LOGGER.warning(
+            "Skipping %s: reference case missing (%s)", case_name, reference_dir
+        )
         return []
 
     pairs: List[tuple[str, Path, Path]] = []
@@ -69,11 +71,19 @@ def collect_view_pairs(case_dir: Path) -> List[tuple[str, Path, Path]]:
         ours_video = case_dir / f"{view}.mp4"
         reference_video = reference_dir / f"{view}.mp4"
         if not ours_video.exists():
-            LOGGER.warning("Skipping %s view %s: ours video missing (%s)", case_name, view, ours_video)
+            LOGGER.warning(
+                "Skipping %s view %s: ours video missing (%s)",
+                case_name,
+                view,
+                ours_video,
+            )
             continue
         if not reference_video.exists():
             LOGGER.warning(
-                "Skipping %s view %s: reference video missing (%s)", case_name, view, reference_video
+                "Skipping %s view %s: reference video missing (%s)",
+                case_name,
+                view,
+                reference_video,
             )
             continue
         pairs.append((view, ours_video, reference_video))

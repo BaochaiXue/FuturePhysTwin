@@ -19,13 +19,14 @@ import time
 import subprocess
 from pathlib import Path
 from typing import Iterable, Sequence
+from argparse import ArgumentParser, Namespace
 
 
-OUTPUT_DIR = Path("gaussian_output_dynamic_white")
-VIEWS: Sequence[str] = ("0", "1", "2")
-EXP_NAME = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
-DATA_ROOT = Path("./data/gaussian_data")
-GAUSSIAN_ROOT = Path("./gaussian_output")
+DEFAULT_OUTPUT_DIR = Path("gaussian_output_dynamic_white")
+DEFAULT_VIEWS: Sequence[str] = ("0", "1", "2")
+DEFAULT_EXP_NAME = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
+DEFAULT_DATA_ROOT = Path("./data/gaussian_data")
+DEFAULT_GAUSSIAN_ROOT = Path("./gaussian_output")
 
 
 def run_command(
@@ -66,11 +67,56 @@ def iter_scene_dirs(root: Path) -> Iterable[Path]:
             yield scene_dir
 
 
+def parse_args() -> Namespace:
+    parser = ArgumentParser(
+        description="Render dynamic Gaussian outputs with white backgrounds."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory to store rendered outputs (default: {DEFAULT_OUTPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--views",
+        nargs="+",
+        default=list(DEFAULT_VIEWS),
+        help=f"View indices to convert into videos (default: {' '.join(DEFAULT_VIEWS)}).",
+    )
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default=DEFAULT_EXP_NAME,
+        help=f"Experiment name specifying the checkpoint subdirectory (default: {DEFAULT_EXP_NAME}).",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help=f"Root directory containing Gaussian scene data (default: {DEFAULT_DATA_ROOT}).",
+    )
+    parser.add_argument(
+        "--gaussian_root",
+        type=Path,
+        default=DEFAULT_GAUSSIAN_ROOT,
+        help=f"Root directory of Gaussian checkpoints (default: {DEFAULT_GAUSSIAN_ROOT}).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for scene_dir in iter_scene_dirs(DATA_ROOT):
+    args = parse_args()
+
+    output_dir = args.output_dir
+    views = tuple(args.views)
+    exp_name = args.exp_name
+    data_root = args.data_root
+    gaussian_root = args.gaussian_root
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for scene_dir in iter_scene_dirs(data_root):
         scene_name = scene_dir.name
-        model_dir = GAUSSIAN_ROOT / scene_name / EXP_NAME
+        model_dir = gaussian_root / scene_name / exp_name
         if not model_dir.exists():
             print(f"[Skip] Colour checkpoint missing for {scene_name}: {model_dir}")
             continue
@@ -87,16 +133,16 @@ def main() -> None:
                 scene_name,
                 "--white_background",
                 "--output_dir",
-                str(OUTPUT_DIR),
+                str(output_dir),
             ]
         )
 
-        for view_name in VIEWS:
-            image_folder = OUTPUT_DIR / scene_name / view_name
+        for view_name in views:
+            image_folder = output_dir / scene_name / view_name
             if not image_folder.exists():
                 print(f"[Skip] Render folder missing for {scene_name}/{view_name}")
                 continue
-            video_path = OUTPUT_DIR / scene_name / f"{view_name}.mp4"
+            video_path = output_dir / scene_name / f"{view_name}.mp4"
             video_path.parent.mkdir(parents=True, exist_ok=True)
             run_command(
                 [
@@ -109,7 +155,7 @@ def main() -> None:
                 ]
             )
 
-            black_folder = OUTPUT_DIR / scene_name / f"{view_name}_black"
+            black_folder = output_dir / scene_name / f"{view_name}_black"
             if black_folder.exists():
                 run_command(
                     [
