@@ -18,9 +18,7 @@ Outputs
 - ``exposure.json`` and TensorBoard logs (when enabled), likewise written to ``color_refine`` for colour runs.
 - Refined appearance parameters saved to ``<model_path>/color_refine/canonical_gaussians_color.npz``, preserving the original canonical checkpoint.
 """
-# TODO: Gaussian xyz 有没有回复到 LBS 变形前的结果？
-# 直接存储 Gaussian Kernel LBS后xyz rot
-# 重新梳理一下代码结构和注释
+
 import os
 import sys
 import uuid
@@ -30,7 +28,11 @@ from pathlib import Path
 from random import randint
 from typing import Any, Optional, Sequence, TYPE_CHECKING
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont
+import re
 from gaussian_splatting.arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_splatting.gaussian_renderer import render, network_gui
 from gaussian_splatting.skinning import LBSDeformer
@@ -41,13 +43,17 @@ from gaussian_splatting.utils.camera_utils import cameraList_from_camInfos
 from gaussian_splatting.utils.general_utils import get_expon_lr_func, safe_state
 from gaussian_splatting.utils.image_utils import psnr  # noqa: F401  # kept for parity
 from gaussian_splatting.utils.loss_utils import (
+    C1 as SSIM_C1,
+    C2 as SSIM_C2,
     anisotropic_loss,
+    create_window as ssim_create_window,
     depth_loss,
     l1_loss,
     normal_loss,
     ssim,
 )
 from tqdm import tqdm
+import math
 
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter as SummaryWriterType
@@ -87,6 +93,350 @@ except Exception:  # pragma: no cover - optional dependency
     print(
         "[warn] SparseGaussianAdam not available; falling back to standard Adam optimiser."
     )
+
+
+def _tensor_to_numpy(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().float().numpy()
+
+
+def _to_uint8_img(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    if tensor is None:
+        return None
+    img = tensor.detach().float().cpu()
+    if img.ndim == 2:
+        img = img.unsqueeze(0)
+    if img.shape[0] == 4:
+        img = img[:3]
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    if img.min() < 0.0 or img.max() > 1.0:
+        min_val = img.min()
+        max_val = img.max()
+        if max_val - min_val > 1e-6:
+            img = (img - min_val) / (max_val - min_val)
+        else:
+            img = torch.zeros_like(img)
+    img = img.clamp(0.0, 1.0)
+    img = (img * 255.0).round().byte().numpy().transpose(1, 2, 0)
+    return img
+
+
+def _save_tensor_as_png(
+    tensor: Optional[torch.Tensor], path: Path, label: Optional[str]
+) -> None:
+    array = _to_uint8_img(tensor)
+    if array is None:
+        return
+    _save_array_with_label(array, path, label)
+
+
+def _annotate_image(img: Image.Image, label: Optional[str]) -> Image.Image:
+    if not label:
+        return img
+    rgba = img.convert("RGBA")
+    draw = ImageDraw.Draw(rgba)
+    font = ImageFont.load_default()
+    text = label
+    if hasattr(draw, "textbbox"):
+        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+        text_w = x1 - x0
+        text_h = y1 - y0
+    else:
+        text_w, text_h = draw.textsize(text, font=font)
+    margin = 6
+    padding = 4
+    rect = (
+        margin - padding,
+        margin - padding,
+        margin + text_w + padding,
+        margin + text_h + padding,
+    )
+    draw.rectangle(rect, fill=(0, 0, 0, 192))
+    draw.text((margin, margin), text, font=font, fill=(255, 255, 255, 255))
+    return rgba.convert("RGB")
+
+
+def _save_array_with_label(
+    array: Optional[np.ndarray], path: Path, label: Optional[str]
+) -> None:
+    if array is None:
+        return
+    img = Image.fromarray(array)
+    img = _annotate_image(img, label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+
+
+def _sanitize_token(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", name.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "untitled"
+
+
+def _normalize_depth_for_vis(
+    depth: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
+    if depth is None:
+        return None
+    depth_cpu = depth.detach().float()
+    if mask is not None:
+        mask_vals = (mask > 0.5).detach()
+        if mask_vals.ndim > 2:
+            mask_vals = mask_vals.squeeze()
+        mask_vals = mask_vals.bool()
+        if mask_vals.shape != depth_cpu.shape:
+            mask_vals = mask_vals.reshape_as(depth_cpu)
+        valid = depth_cpu[mask_vals]
+        if valid.numel() > 0:
+            min_val = valid.min()
+            max_val = valid.max()
+        else:
+            min_val = depth_cpu.min()
+            max_val = depth_cpu.max()
+    else:
+        min_val = depth_cpu.min()
+        max_val = depth_cpu.max()
+    if max_val - min_val > 1e-6:
+        norm = (depth_cpu - min_val) / (max_val - min_val)
+    else:
+        norm = torch.zeros_like(depth_cpu)
+    return norm.unsqueeze(0).clamp(0.0, 1.0)
+
+
+def _compute_l1_map(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    diff = torch.abs(a - b).mean(0, keepdim=True)
+    return diff.repeat(3, 1, 1)
+
+
+def _compute_ssim_map(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    channel = a.shape[0]
+    window_size = 11
+    window = ssim_create_window(window_size, channel).to(dtype=a.dtype, device=a.device)
+    a4 = a.unsqueeze(0)
+    b4 = b.unsqueeze(0)
+    mu1 = F.conv2d(a4, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(b4, window, padding=window_size // 2, groups=channel)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = (
+        F.conv2d(a4 * a4, window, padding=window_size // 2, groups=channel) - mu1_sq
+    )
+    sigma2_sq = (
+        F.conv2d(b4 * b4, window, padding=window_size // 2, groups=channel) - mu2_sq
+    )
+    sigma12 = (
+        F.conv2d(a4 * b4, window, padding=window_size // 2, groups=channel) - mu1_mu2
+    )
+    c1 = SSIM_C1
+    c2 = SSIM_C2
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+        (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    )
+    ssim_map = ssim_map.mean(1, keepdim=False)
+    return ssim_map.squeeze(0)
+
+
+def _make_contact_sheet(
+    images: list[tuple[str, Optional[np.ndarray]]],
+) -> Optional[np.ndarray]:
+    valid: list[tuple[str, np.ndarray]] = [
+        (label, img) for label, img in images if img is not None
+    ]
+    if not valid:
+        return None
+    pil_images: list[Image.Image] = []
+    heights = []
+    widths = []
+    for label, array in valid:
+        img = Image.fromarray(array)
+        heights.append(img.height)
+        widths.append(img.width)
+        pil_images.append(_annotate_image(img, None))
+    min_h = min(heights)
+    resized = []
+    for img in pil_images:
+        if img.height != min_h:
+            scale = min_h / img.height
+            new_w = max(1, int(round(img.width * scale)))
+            img = img.resize((new_w, min_h), Image.BILINEAR)
+            resized.append(img)
+        else:
+            resized.append(img)
+    n = len(resized)
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+    cell_w = max(img.width for img in resized)
+    cell_h = max(img.height for img in resized)
+    font = ImageFont.load_default()
+    sheet = Image.new(
+        "RGB", (cols * cell_w, rows * (cell_h + font.size + 8)), color=(0, 0, 0)
+    )
+    draw = ImageDraw.Draw(sheet)
+    for idx, (orig, img) in enumerate(zip(valid, resized)):
+        label, _ = orig
+        row = idx // cols
+        col = idx % cols
+        x = col * cell_w
+        y = row * (cell_h + font.size + 8)
+        sheet.paste(img, (x, y))
+        text_y = y + cell_h + 4
+        draw.text((x, text_y), label, font=font, fill=(255, 255, 255))
+    return np.array(sheet)
+
+
+def _expand_mask(
+    mask: Optional[torch.Tensor], height: int, width: int
+) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    mask = mask.float()
+    mask = mask.expand(-1, height, width)
+    return mask
+
+
+def _make_bg_patch(
+    bg: Optional[torch.Tensor], height: int, width: int
+) -> Optional[torch.Tensor]:
+    if bg is None:
+        return None
+    return bg.view(3, 1, 1).expand(3, height, width)
+
+
+def dump_viz(
+    iteration: int,
+    frame_id: int,
+    cam_uid: int,
+    image_name: Optional[str],
+    root: Path,
+    *,
+    pred_rgb_raw: torch.Tensor,
+    pred_rgb_masked: torch.Tensor,
+    pred_seg_raw: torch.Tensor,
+    pred_seg_masked: torch.Tensor,
+    gt_raw: torch.Tensor,
+    gt_masked: torch.Tensor,
+    alpha_mask: Optional[torch.Tensor],
+    occ_mask: Optional[torch.Tensor],
+    inv_occ_mask: Optional[torch.Tensor],
+    depth_raw: Optional[torch.Tensor],
+    depth_masked: Optional[torch.Tensor],
+    normal_raw: Optional[torch.Tensor],
+    normal_masked: Optional[torch.Tensor],
+    bg_color: Optional[torch.Tensor],
+) -> None:
+    height, width = pred_rgb_raw.shape[1:]
+    pred_rgb_clamped = pred_rgb_raw.clamp(0.0, 1.0)
+    pred_rgb_masked_clamped = pred_rgb_masked.clamp(0.0, 1.0)
+    gt_raw_clamped = gt_raw.clamp(0.0, 1.0)
+    gt_masked_clamped = gt_masked.clamp(0.0, 1.0)
+    alpha_vis = _expand_mask(alpha_mask, height, width)
+    occ_vis = _expand_mask(occ_mask, height, width)
+    inv_occ_vis = _expand_mask(inv_occ_mask, height, width)
+    depth_vis = _normalize_depth_for_vis(depth_raw, alpha_mask)
+    depth_vis_masked = _normalize_depth_for_vis(depth_masked, alpha_mask)
+    normal_vis = (
+        normal_raw.permute(2, 0, 1)
+        if normal_raw is not None and normal_raw.ndim == 3
+        else normal_raw
+    )
+    normal_masked_vis = (
+        normal_masked.permute(2, 0, 1)
+        if normal_masked is not None and normal_masked.ndim == 3
+        else normal_masked
+    )
+    if normal_vis is not None:
+        normal_vis = (normal_vis + 1.0) / 2.0
+    if normal_masked_vis is not None:
+        normal_masked_vis = (normal_masked_vis + 1.0) / 2.0
+    bg_patch = _make_bg_patch(bg_color, height, width)
+    l1_full = _compute_l1_map(pred_rgb_clamped, gt_raw_clamped)
+    l1_masked = _compute_l1_map(pred_rgb_masked_clamped, gt_masked_clamped)
+    ssim_full = (
+        _compute_ssim_map(pred_rgb_clamped, gt_raw_clamped)
+        .clamp(0.0, 1.0)
+        .repeat(3, 1, 1)
+    )
+    ssim_masked = (
+        _compute_ssim_map(pred_rgb_masked_clamped, gt_masked_clamped)
+        .clamp(0.0, 1.0)
+        .repeat(3, 1, 1)
+    )
+    base_token = _sanitize_token(image_name) if image_name else f"frame_{frame_id:05d}"
+    base_name = f"i{iteration:07d}_c{cam_uid:04d}_f{frame_id:05d}_{base_token}"
+    image_entries: list[tuple[str, Optional[torch.Tensor], str]] = [
+        ("pred_rgb_raw", pred_rgb_raw, "Pred RGB (raw)"),
+        ("pred_rgb_masked", pred_rgb_masked, "Pred RGB (masked)"),
+        ("pred_seg_raw", pred_seg_raw, "Pred Alpha/Seg (raw)"),
+        ("pred_seg_masked", pred_seg_masked, "Pred Alpha/Seg (masked)"),
+        ("gt_rgb_raw", gt_raw, "GT RGB (raw)"),
+        ("gt_rgb_masked", gt_masked, "GT RGB (masked)"),
+        ("alpha_mask", alpha_vis, "Alpha Mask"),
+        ("occ_mask", occ_vis, "Occlusion Mask"),
+        ("inv_occ_mask", inv_occ_vis, "Inverse Occlusion"),
+        ("depth", depth_vis, "Depth"),
+        ("depth_masked", depth_vis_masked, "Depth (masked)"),
+        ("normal", normal_vis, "Normal"),
+        ("normal_masked", normal_masked_vis, "Normal (masked)"),
+        ("l1", l1_full, "L1 Map"),
+        ("l1_masked", l1_masked, "L1 Map (masked)"),
+        ("ssim", ssim_full, "SSIM Map"),
+        ("ssim_masked", ssim_masked, "SSIM Map (masked)"),
+        ("background", bg_patch, "Background Color"),
+    ]
+    for class_dir, tensor, label in image_entries:
+        target_path = root / class_dir / f"{base_name}.png"
+        _save_tensor_as_png(tensor, target_path, label)
+    contact_images = [
+        ("Pred RGB (raw)", _to_uint8_img(pred_rgb_raw)),
+        ("Pred RGB (masked)", _to_uint8_img(pred_rgb_masked)),
+        ("GT RGB (raw)", _to_uint8_img(gt_raw)),
+        ("GT RGB (masked)", _to_uint8_img(gt_masked)),
+        ("Alpha Mask", _to_uint8_img(alpha_vis)),
+        ("Occlusion Mask", _to_uint8_img(occ_vis)),
+        ("L1 Map", _to_uint8_img(l1_full)),
+        ("SSIM Map", _to_uint8_img(ssim_full)),
+        ("Background Color", _to_uint8_img(bg_patch)),
+    ]
+    contact = _make_contact_sheet(contact_images)
+    if contact is not None:
+        contact_path = root / "contact_sheet" / f"{base_name}.png"
+        _save_array_with_label(contact, contact_path, "Contact Sheet")
+    npz_payload: dict[str, np.ndarray] = {
+        "pred_rgb_raw": _tensor_to_numpy(pred_rgb_raw),
+        "pred_rgb_masked": _tensor_to_numpy(pred_rgb_masked),
+        "pred_seg_raw": _tensor_to_numpy(pred_seg_raw),
+        "pred_seg_masked": _tensor_to_numpy(pred_seg_masked),
+        "gt_raw": _tensor_to_numpy(gt_raw),
+        "gt_masked": _tensor_to_numpy(gt_masked),
+        "l1_full": _tensor_to_numpy(l1_full),
+        "l1_masked": _tensor_to_numpy(l1_masked),
+        "ssim_full": _tensor_to_numpy(ssim_full),
+        "ssim_masked": _tensor_to_numpy(ssim_masked),
+    }
+    if alpha_mask is not None:
+        npz_payload["alpha_mask"] = _tensor_to_numpy(alpha_mask)
+    if occ_mask is not None:
+        npz_payload["occ_mask"] = _tensor_to_numpy(occ_mask)
+    if inv_occ_mask is not None:
+        npz_payload["inv_occ_mask"] = _tensor_to_numpy(inv_occ_mask)
+    if depth_raw is not None:
+        npz_payload["depth_raw"] = _tensor_to_numpy(depth_raw)
+    if depth_masked is not None:
+        npz_payload["depth_masked"] = _tensor_to_numpy(depth_masked)
+    if normal_raw is not None:
+        npz_payload["normal_raw"] = _tensor_to_numpy(normal_raw)
+    if normal_masked is not None:
+        npz_payload["normal_masked"] = _tensor_to_numpy(normal_masked)
+    if bg_color is not None:
+        npz_payload["bg_color"] = _tensor_to_numpy(bg_color)
+    snapshot_dir = root / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(snapshot_dir / f"{base_name}.npz", **npz_payload)
 
 
 def load_lbs_data(path: Path) -> dict[str, torch.Tensor]:
@@ -146,6 +496,10 @@ def training(
     lbs_path: Optional[Path] = None,
     frames_dir: Optional[Path] = None,
     lbs_pose_cache: Optional[Path] = None,
+    viz_every: int = 0,
+    viz_frames: Optional[set[int]] = None,
+    viz_cams: Optional[set[int]] = None,
+    viz_root: Optional[Path] = None,
 ) -> None:
     """
     Run the full Gaussian optimisation loop for a preprocessed QQTT scene.
@@ -167,6 +521,8 @@ def training(
     lbs_deformer: Optional[LBSDeformer] = None
     lbs_motions: Optional[torch.Tensor] = None
     pose_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
+    canonical_xyz_ref: Optional[torch.Tensor] = None
+    canonical_rot_ref: Optional[torch.Tensor] = None
 
     first_iter: int = 0
     # Create the output folder structure and, if available, a TensorBoard writer.
@@ -245,6 +601,8 @@ def training(
                 f"[LBS] Loaded offline pose cache with {len(pose_cache)} frames "
                 f"from {lbs_pose_cache}"
             )
+            canonical_xyz_ref = gaussians.get_xyz_canonical().detach().clone()
+            canonical_rot_ref = gaussians.get_rotation_canonical().detach().clone()
         elif lbs_path is not None:
             lbs_payload = load_lbs_data(lbs_path)
             lbs_deformer = LBSDeformer(
@@ -337,6 +695,13 @@ def training(
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    viz_frames_set = set(viz_frames) if viz_frames is not None else None
+    viz_cams_set = set(viz_cams) if viz_cams is not None else None
+    viz_root_path = (
+        Path(viz_root)
+        if viz_root is not None
+        else Path(dataset.model_path) / "debug_visualize" / "color_stage"
+    )
     for iteration in range(first_iter, opt.iterations + 1):
         # Lazily attach to the interactive viewer so render previews can be streamed.
         if network_gui.conn is None:
@@ -398,6 +763,15 @@ def training(
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        cam_uid = getattr(viewpoint_cam, "uid", -1)
+        image_token = getattr(viewpoint_cam, "image_name", None)
+        should_viz = (
+            viz_every > 0
+            and iteration % viz_every == 0
+            and (viz_frames_set is None or frame_id in viz_frames_set)
+            and (viz_cams_set is None or cam_uid in viz_cams_set)
+        )
+
         # Use either random backgrounds (for regularisation) or the configured constant.
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
@@ -409,6 +783,24 @@ def training(
                     f"({len(pose_cache)} cached frames). Ensure indices align."
                 )
             posed_xyz, posed_rot = posed
+            if (
+                canonical_xyz_ref is not None
+                and canonical_rot_ref is not None
+                and frame_id != canonical_frame_idx
+            ):
+                xyz_is_canonical = torch.allclose(
+                    posed_xyz, canonical_xyz_ref, atol=1e-5, rtol=1e-4
+                )
+                rot_is_canonical = torch.allclose(
+                    posed_rot, canonical_rot_ref, atol=1e-5, rtol=1e-4
+                )
+                if xyz_is_canonical and rot_is_canonical:
+                    raise RuntimeError(
+                        "[LBS] Offline pose cache entry for "
+                        f"frame {frame_id} matches the canonical pose "
+                        f"({canonical_frame_idx}). The pose cache likely "
+                        "does not align with the colour-only training frames."
+                    )
             pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
         elif (
             color_only
@@ -448,7 +840,7 @@ def training(
                     separate_sh=SPARSE_ADAM_AVAILABLE,
                 )
 
-            image = render_pkg["render"]
+            render_rgba = render_pkg["render"]
             depth = render_pkg["depth"]
             normal = render_pkg["normal"]
             viewspace_points = render_pkg["viewspace_points"]
@@ -456,25 +848,82 @@ def training(
             radii = render_pkg["radii"]
 
             # Decompose RGBA(+mask) tensor produced by the renderer.
-            pred_seg = image[3:, ...]
-            image = image[:3, ...]
+            pred_seg = render_rgba[3:, ...]
+            image = render_rgba[:3, ...]
             gt_image = viewpoint_cam.original_image.cuda()
+            viz_pred_rgb_raw: Optional[torch.Tensor] = None
+            viz_pred_seg_raw: Optional[torch.Tensor] = None
+            viz_gt_raw: Optional[torch.Tensor] = None
+            viz_depth_raw: Optional[torch.Tensor] = None
+            viz_normal_raw: Optional[torch.Tensor] = None
+            if should_viz:
+                viz_pred_rgb_raw = image.detach().clone()
+                viz_pred_seg_raw = pred_seg.detach().clone()
+                viz_gt_raw = gt_image.detach().clone()
+                if depth is not None:
+                    viz_depth_raw = depth.detach().clone()
+                if normal is not None:
+                    viz_normal_raw = normal.detach().clone()
 
+            occ_mask_tensor: Optional[torch.Tensor] = None
+            inv_occ_mask_tensor: Optional[torch.Tensor] = None
             if viewpoint_cam.occ_mask is not None:
                 # Suppress gradients in regions flagged as occluded by preprocessing.
-                occ_mask = viewpoint_cam.occ_mask.cuda()
-                inv_occ_mask = 1.0 - occ_mask
+                occ_mask_tensor = viewpoint_cam.occ_mask.cuda()
+                inv_occ_mask_tensor = 1.0 - occ_mask_tensor
 
-                image *= inv_occ_mask.unsqueeze(0)
-                pred_seg *= inv_occ_mask.unsqueeze(0)
-                depth *= inv_occ_mask
+                image *= inv_occ_mask_tensor.unsqueeze(0)
+                pred_seg *= inv_occ_mask_tensor.unsqueeze(0)
+                if depth is not None:
+                    depth *= inv_occ_mask_tensor
                 if normal is not None:
-                    normal *= inv_occ_mask.unsqueeze(-1)
+                    normal *= inv_occ_mask_tensor.unsqueeze(-1)
 
+            alpha_mask_tensor: Optional[torch.Tensor] = None
             if viewpoint_cam.alpha_mask is not None:
                 # Exclude background pixels when masks are provided.
-                alpha_mask = viewpoint_cam.alpha_mask.cuda()
-                gt_image *= alpha_mask
+                alpha_mask_tensor = viewpoint_cam.alpha_mask.cuda()
+                gt_image *= alpha_mask_tensor
+
+            if should_viz:
+                pred_rgb_masked = image.detach().clone()
+                pred_seg_masked = pred_seg.detach().clone()
+                gt_masked = gt_image.detach().clone()
+                depth_masked = depth.detach().clone() if depth is not None else None
+                normal_masked = normal.detach().clone() if normal is not None else None
+                dump_viz(
+                    iteration=iteration,
+                    frame_id=int(frame_id),
+                    cam_uid=int(cam_uid),
+                    image_name=image_token,
+                    root=viz_root_path,
+                    pred_rgb_raw=(
+                        viz_pred_rgb_raw
+                        if viz_pred_rgb_raw is not None
+                        else image.detach().clone()
+                    ),
+                    pred_rgb_masked=pred_rgb_masked,
+                    pred_seg_raw=(
+                        viz_pred_seg_raw
+                        if viz_pred_seg_raw is not None
+                        else pred_seg.detach().clone()
+                    ),
+                    pred_seg_masked=pred_seg_masked,
+                    gt_raw=(
+                        viz_gt_raw
+                        if viz_gt_raw is not None
+                        else gt_image.detach().clone()
+                    ),
+                    gt_masked=gt_masked,
+                    alpha_mask=alpha_mask_tensor,
+                    occ_mask=occ_mask_tensor,
+                    inv_occ_mask=inv_occ_mask_tensor,
+                    depth_raw=viz_depth_raw,
+                    depth_masked=depth_masked,
+                    normal_raw=viz_normal_raw,
+                    normal_masked=normal_masked,
+                    bg_color=bg.detach().clone(),
+                )
 
             # Photometric supervision mixes L1 and SSIM according to lambda_dssim.
             Ll1 = l1_loss(image, gt_image)
@@ -720,9 +1169,45 @@ def main() -> None:
         default=None,
         help="Path to offline LBS cache (.pt) produced by precompute_lbs_pose_cache.py.",
     )
+    parser.add_argument(
+        "--viz_every",
+        type=int,
+        default=0,
+        help="Dump debug visualisations every N iterations (0 disables).",
+    )
+    parser.add_argument(
+        "--viz_frames",
+        type=str,
+        default=None,
+        help="Comma-separated list of frame IDs to visualise.",
+    )
+    parser.add_argument(
+        "--viz_cams",
+        type=str,
+        default=None,
+        help="Comma-separated list of camera UIDs to visualise.",
+    )
+    parser.add_argument(
+        "--viz_out",
+        type=str,
+        default=None,
+        help="Output directory for debug visualisations.",
+    )
     args = parser.parse_args(sys.argv[1:])
     # Always capture the terminal iteration so the final state is stored on disk.
     args.save_iterations.append(args.iterations)
+
+    def _parse_int_set(spec: Optional[str]) -> Optional[set[int]]:
+        if spec is None:
+            return None
+        values = [item.strip() for item in spec.split(",") if item.strip()]
+        if not values:
+            return None
+        return {int(item) for item in values}
+
+    viz_frames = _parse_int_set(args.viz_frames)
+    viz_cams = _parse_int_set(args.viz_cams)
+    viz_root = Path(args.viz_out).expanduser() if args.viz_out else None
 
     print(f"Optimizing {args.model_path}")
 
@@ -748,6 +1233,10 @@ def main() -> None:
         lbs_path=args.lbs_path,
         frames_dir=args.frames_dir,
         lbs_pose_cache=args.lbs_pose_cache,
+        viz_every=args.viz_every,
+        viz_frames=viz_frames,
+        viz_cams=viz_cams,
+        viz_root=viz_root,
     )
 
     print("\nTraining complete.")

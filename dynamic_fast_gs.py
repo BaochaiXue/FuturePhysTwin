@@ -335,6 +335,7 @@ def main() -> None:
                 "colour stage will run without pose deformation."
             )
         color_command.extend(["--frames_dir", str(data_dir)])
+        color_command.extend(["--viz_every", "1000"])
         run_command(color_command)
         final_models.append((scene_dir, scene_name, model_dir / "color_refine"))
 

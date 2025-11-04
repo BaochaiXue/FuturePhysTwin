@@ -36,7 +36,8 @@ import torch
 from gaussian_splatting.dynamic_utils import (
     calc_weights_vals_from_indices,
     get_topk_indices,
-    interpolate_motions_speedup,
+    interpolate_motions,
+    knn_weights,
     knn_weights_sparse,
 )
 from gaussian_splatting.utils.canonical_io import load_canonical_npz, resolve_canonical_npz
@@ -172,20 +173,48 @@ def main() -> None:
 
     pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
     cache_dtype = torch.float16 if args.half else torch.float32
+    # Prepare containers used for rollout-style accumulation so we can emulate
+    # gs_render_dynamics.py and reuse its temporal integration behaviour.
+    chunk_size = 5_000
+    all_xyz = xyz0.detach().clone()
+    all_quat = quat0.detach().clone()
 
     torch.set_grad_enabled(False)
     for t in range(T):
-        bones_t = prev_x[t]
-        motions_t = x[t] - bones_t
-        posed_xyz, posed_quat, _ = interpolate_motions_speedup(
-            bones=bones_t,
-            motions=motions_t,
-            relations=relations,
-            weights=weights,
-            weights_indices=weights_idx,
-            xyz=xyz0,
-            quat=quat0,
-        )
+        if t == 0:
+            posed_xyz = all_xyz
+            posed_quat = all_quat
+        else:
+            prev_ctrl = prev_x[t].to(device=device, dtype=torch.float32)
+            cur_ctrl = x[t].to(device=device, dtype=torch.float32)
+            motions_t = cur_ctrl - prev_ctrl
+
+            num_chunks = (all_xyz.shape[0] + chunk_size - 1) // chunk_size
+            for j in range(num_chunks):
+                start = j * chunk_size
+                end = min((j + 1) * chunk_size, all_xyz.shape[0])
+                xyz_chunk = all_xyz[start:end]
+                quat_chunk = all_quat[start:end]
+                weights_dense = knn_weights(
+                    prev_ctrl,
+                    xyz_chunk,
+                    K=knn_k,
+                )
+                xyz_chunk_new, quat_chunk_new, _ = interpolate_motions(
+                    bones=prev_ctrl,
+                    motions=motions_t,
+                    relations=relations,
+                    weights=weights_dense,
+                    xyz=xyz_chunk,
+                    quat=quat_chunk,
+                    device=device,
+                    step=t,
+                )
+                all_xyz[start:end] = xyz_chunk_new
+                all_quat[start:end] = quat_chunk_new
+
+            posed_xyz = all_xyz
+            posed_quat = all_quat
         pose_cache[int(t)] = {
             "xyz": posed_xyz.detach().to(dtype=cache_dtype, device="cpu"),
             "quat": posed_quat.detach().to(dtype=cache_dtype, device="cpu"),
@@ -194,6 +223,7 @@ def main() -> None:
             print(f"[LBS] Processed frame {t + 1}/{T}")
 
     payload: Dict[str, Any] = {
+        "bones0": bones0.detach().cpu().to(dtype=torch.float32),
         "relations": relations.detach().cpu().long(),
         "weights_idx": weights_idx.detach().cpu().long(),
         "weights": weights.detach().cpu().to(dtype=torch.float32),
