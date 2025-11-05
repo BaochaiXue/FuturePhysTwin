@@ -398,8 +398,8 @@ def dump_viz(
         ("GT RGB (masked)", _to_uint8_img(gt_masked)),
         ("Alpha Mask", _to_uint8_img(alpha_vis)),
         ("Occlusion Mask", _to_uint8_img(occ_vis)),
-        ("L1 Map", _to_uint8_img(l1_full)),
-        ("SSIM Map", _to_uint8_img(ssim_full)),
+        ("L1 Map (masked)", _to_uint8_img(l1_masked)),
+        ("SSIM Map (masked)", _to_uint8_img(ssim_masked)),
         ("Background Color", _to_uint8_img(bg_patch)),
     ]
     contact = _make_contact_sheet(contact_images)
@@ -500,6 +500,8 @@ def training(
     viz_frames: Optional[set[int]] = None,
     viz_cams: Optional[set[int]] = None,
     viz_root: Optional[Path] = None,
+    train_frames: Optional[set[int]] = None,
+    train_cams: Optional[set[int]] = None,
 ) -> None:
     """
     Run the full Gaussian optimisation loop for a preprocessed QQTT scene.
@@ -636,45 +638,60 @@ def training(
     except ValueError:
         canonical_frame_idx = 0
 
-    base_cameras = list(scene.getTrainCameras())
-    camera_entries: list[tuple[int, Any]] = [
-        (canonical_frame_idx, cam) for cam in base_cameras
-    ]
+    camera_entries: list[tuple[int, Any]] = []
+    seen_paths: set[Path] = set()
+
+    def ingest_frame_dir(frame_path: Path) -> None:
+        resolved = frame_path.resolve()
+        if resolved in seen_paths or not frame_path.is_dir():
+            return
+        try:
+            frame_idx_local = int(frame_path.parent.name)
+        except ValueError:
+            return
+        if train_frames is not None and frame_idx_local not in train_frames:
+            return
+        try:
+            scene_info_local = readQQTTSceneInfo(
+                str(frame_path),
+                dataset.images,
+                dataset.depths,
+                dataset.eval,
+                dataset.train_test_exp,
+                dataset.use_masks,
+                dataset.gs_init_opt,
+                dataset.pts_per_triangles,
+                dataset.use_high_res,
+            )
+        except FileNotFoundError:
+            return
+        extra_cams_local = cameraList_from_camInfos(
+            scene_info_local.train_cameras,
+            1.0,
+            dataset,
+            scene_info_local.is_nerf_synthetic,
+            False,
+        )
+        selected_cams: list[Any] = []
+        for cam_local in extra_cams_local:
+            cam_uid = getattr(cam_local, "uid", None)
+            if train_cams is not None and cam_uid not in train_cams:
+                continue
+            selected_cams.append(cam_local)
+        if selected_cams:
+            for cam_local in selected_cams:
+                camera_entries.append((frame_idx_local, cam_local))
+        seen_paths.add(resolved)
 
     if frames_dir is not None:
         frames_root = Path(frames_dir)
         for frame_path in sorted(frames_root.glob(f"*/{scene_name}")):
-            if not frame_path.is_dir():
-                continue
-            try:
-                frame_idx = int(frame_path.parent.name)
-            except ValueError:
-                continue
-            if frame_path.resolve() == scene_path.resolve():
-                continue
-            try:
-                scene_info = readQQTTSceneInfo(
-                    str(frame_path),
-                    dataset.images,
-                    dataset.depths,
-                    dataset.eval,
-                    dataset.train_test_exp,
-                    dataset.use_masks,
-                    dataset.gs_init_opt,
-                    dataset.pts_per_triangles,
-                    dataset.use_high_res,
-                )
-            except FileNotFoundError:
-                continue
-            extra_cams = cameraList_from_camInfos(
-                scene_info.train_cameras,
-                1.0,
-                dataset,
-                scene_info.is_nerf_synthetic,
-                False,
-            )
-            for cam in extra_cams:
-                camera_entries.append((frame_idx, cam))
+            ingest_frame_dir(frame_path)
+
+    if not camera_entries and (
+        train_frames is None or canonical_frame_idx in train_frames
+    ):
+        ingest_frame_dir(scene_path)
 
     if not camera_entries:
         raise RuntimeError("No training cameras available for colour stage.")
@@ -1164,6 +1181,19 @@ def main() -> None:
         help="Optional root containing per-frame data (reserved for future use).",
     )
     parser.add_argument(
+        "--train_frames",
+        type=str,
+        default=None,
+        help="Comma-separated list of frame indices to use during colour training.",
+    )
+    parser.add_argument(
+        "--train_cams",
+        nargs="+",
+        type=int,
+        default=None,
+        help="List of camera UIDs to use during colour training.",
+    )
+    parser.add_argument(
         "--lbs_pose_cache",
         type=Path,
         default=None,
@@ -1197,10 +1227,13 @@ def main() -> None:
     # Always capture the terminal iteration so the final state is stored on disk.
     args.save_iterations.append(args.iterations)
 
-    def _parse_int_set(spec: Optional[str]) -> Optional[set[int]]:
+    def _parse_int_set(spec: Optional[Any]) -> Optional[set[int]]:
         if spec is None:
             return None
-        values = [item.strip() for item in spec.split(",") if item.strip()]
+        if isinstance(spec, (list, tuple, set)):
+            values = [str(item).strip() for item in spec if str(item).strip()]
+        else:
+            values = [item.strip() for item in str(spec).split(",") if item.strip()]
         if not values:
             return None
         return {int(item) for item in values}
@@ -1208,6 +1241,8 @@ def main() -> None:
     viz_frames = _parse_int_set(args.viz_frames)
     viz_cams = _parse_int_set(args.viz_cams)
     viz_root = Path(args.viz_out).expanduser() if args.viz_out else None
+    train_frames = _parse_int_set(args.train_frames)
+    train_cams = _parse_int_set(args.train_cams)
 
     print(f"Optimizing {args.model_path}")
 
@@ -1237,6 +1272,8 @@ def main() -> None:
         viz_frames=viz_frames,
         viz_cams=viz_cams,
         viz_root=viz_root,
+        train_frames=train_frames,
+        train_cams=train_cams,
     )
 
     print("\nTraining complete.")

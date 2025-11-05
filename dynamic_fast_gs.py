@@ -313,7 +313,12 @@ def main() -> None:
             print(
                 f"[LBS] Warning: {motion_source} missing; skip offline pose cache generation."
             )
-
+        color_iterations = max(
+            args.iterations,
+            args.iterations * frame_count.get(scene_name, 1) // 10,
+        )
+        # TODO: delete when real train
+        color_iterations = 10000
         color_command: list[str] = [
             "python",
             str(root / "dynamic_fast_color.py"),
@@ -324,7 +329,7 @@ def main() -> None:
             "--model_path",
             str(model_dir),
             "--iterations",
-            str(args.iterations * frame_count.get(scene_name, 1) // 10),
+            str(color_iterations),
             "--use_masks",
         ]
         if pose_cache_path.exists():
@@ -335,6 +340,9 @@ def main() -> None:
                 "colour stage will run without pose deformation."
             )
         color_command.extend(["--frames_dir", str(data_dir)])
+        color_command.extend(["--train_frames", "115"])
+        # color_command.append("--train_cams")
+        # color_command.extend(str(cam) for cam in [1])
         color_command.extend(["--viz_every", "1000"])
         run_command(color_command)
         final_models.append((scene_dir, scene_name, model_dir / "color_refine"))
