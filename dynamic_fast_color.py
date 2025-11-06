@@ -901,6 +901,7 @@ def training(
                 # Exclude background pixels when masks are provided.
                 alpha_mask_tensor = viewpoint_cam.alpha_mask.cuda()
                 gt_image *= alpha_mask_tensor
+                image = image * alpha_mask_tensor
 
             if should_viz:
                 pred_rgb_masked = image.detach().clone()
