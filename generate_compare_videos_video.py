@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from moviepy import (
     ColorClip,
+    CompositeVideoClip,
+    TextClip,
     VideoClip,
     VideoFileClip,
     clips_array,
@@ -37,6 +40,7 @@ OURS_ROOT = SCRIPT_ROOT / "gaussian_output_dynamic_white"
 REFERENCE_ROOT = SCRIPT_ROOT / "tmp_gaussian_output_dynamic_white"
 OUTPUT_ROOT = SCRIPT_ROOT / "compare_visualization_videos"
 CAMERA_VIEWS: Tuple[str, ...] = ("0", "1", "2")
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("compare_videos_video")
@@ -110,17 +114,110 @@ def _clip_fps(clip: VideoClip) -> float:
 
 def extend_clip(clip: VideoClip, target_duration: float) -> VideoClip:
     if target_duration - clip.duration <= 1e-3:
-        return clip if abs(clip.duration - target_duration) <= 1e-3 else clip.subclip(
-            0, target_duration
+        return (
+            clip
+            if abs(clip.duration - target_duration) <= 1e-3
+            else clip.subclipped(0, target_duration)
         )
     pad_duration = max(0.0, target_duration - clip.duration)
     if pad_duration <= 1e-3:
         return clip
     fps = _clip_fps(clip)
-    color_pad = ColorClip(size=clip.size, color=(255, 255, 255), duration=pad_duration)
-    color_pad = color_pad.set_fps(fps)
+    color_pad = ColorClip(
+        size=clip.size, color=(255, 255, 255), duration=pad_duration
+    ).with_fps(fps)
     padded = concatenate_videoclips([clip, color_pad], method="compose")
-    return padded.set_fps(fps)
+    return padded.with_fps(fps)
+
+
+def annotate_clip(clip: VideoClip, label: str) -> Tuple[VideoClip, List[VideoClip]]:
+    """Overlay ``label`` in the top-left corner of ``clip``."""
+
+    if not label:
+        return clip, []
+
+    duration = clip.duration
+    font_size = max(24, clip.h // 15)
+    max_text_width = max(100, int(clip.w - 60))
+
+    text_clip = TextClip(
+        text=label,
+        font_size=font_size,
+        color="white",
+        method="caption",
+        size=(max_text_width, None),
+        text_align="left",
+    ).with_duration(duration)
+
+    padding = 12
+    background_width = min(int(clip.w - 20), int(text_clip.w + padding * 2))
+    background_height = int(text_clip.h + padding * 2)
+
+    background_clip = ColorClip(
+        size=(background_width, background_height),
+        color=(0, 0, 0),
+        duration=duration,
+    ).with_opacity(0.6)
+
+    composite = (
+        CompositeVideoClip(
+            [
+                clip,
+                background_clip.with_position((15, 15)),
+                text_clip.with_position((15 + padding, 15 + padding // 2)),
+            ]
+        )
+        .with_duration(duration)
+        .with_fps(_clip_fps(clip))
+    )
+
+    return composite, [text_clip, background_clip]
+
+
+def add_title_bar(
+    clip: VideoClip, title: Optional[str]
+) -> Tuple[VideoClip, List[VideoClip]]:
+    """Create a new clip with ``title`` rendered above the provided ``clip``."""
+
+    if title is None:
+        return clip, []
+
+    title_text = title.strip()
+    if not title_text:
+        return clip, []
+
+    duration = clip.duration
+    base_fps = _clip_fps(clip)
+    font_size = max(32, clip.h // 20)
+    title_area_width = int(clip.w - 40)
+    text_clip = TextClip(
+        text=title_text,
+        font_size=font_size,
+        color="black",
+        method="caption",
+        size=(title_area_width, None),
+        text_align="center",
+    ).with_duration(duration)
+
+    bar_height = max(int(text_clip.h + 30), font_size + 20)
+    canvas = ColorClip(
+        size=(clip.w, clip.h + bar_height), color=(255, 255, 255), duration=duration
+    )
+    text_y = max(0, (bar_height - text_clip.h) // 2)
+
+    composite = (
+        CompositeVideoClip(
+            [
+                canvas,
+                clip.with_position((0, bar_height)),
+                text_clip.with_position(("center", text_y)),
+            ]
+        )
+        .with_duration(duration)
+        .with_fps(base_fps)
+    )
+
+    return composite, [text_clip, canvas]
 
 
 def close_clip(clip: Optional[VideoClip]) -> None:
@@ -131,17 +228,20 @@ def close_clip(clip: Optional[VideoClip]) -> None:
         closer()
 
 
-def process_case(case_dir: Path, output_dir: Path) -> None:
+def process_case(
+    case_dir: Path, output_dir: Path, title_template: Optional[str]
+) -> None:
     case_name = case_dir.name
     pairs = collect_view_pairs(case_dir)
     if not pairs:
         return
 
-    row_clips: List[Tuple[str, VideoClip, VideoClip]] = []
+    pair_clips: List[Tuple[str, VideoClip, VideoClip]] = []
     pair_durations: List[float] = []
     raw_clips: List[VideoFileClip] = []
     grid: Optional[VideoClip] = None
-    grid_components: List[VideoClip] = []
+    closeables: List[VideoClip] = []
+    final_clip: Optional[VideoClip] = None
 
     try:
         for view, ours_path, ref_path in pairs:
@@ -151,32 +251,65 @@ def process_case(case_dir: Path, output_dir: Path) -> None:
 
             target_height = max(ours_clip.h, ref_clip.h)
             if ours_clip.h != target_height:
-                ours_clip = ours_clip.resize(height=target_height)
+                ours_clip = ours_clip.resized(height=target_height)
             if ref_clip.h != target_height:
-                ref_clip = ref_clip.resize(height=target_height)
+                ref_clip = ref_clip.resized(height=target_height)
 
             pair_duration = max(ours_clip.duration, ref_clip.duration)
             ours_aligned = extend_clip(ours_clip, pair_duration)
             ref_aligned = extend_clip(ref_clip, pair_duration)
 
-            row_clips.append((view, ours_aligned, ref_aligned))
+            pair_clips.append((view, ours_aligned, ref_aligned))
             pair_durations.append(pair_duration)
 
         total_duration = max(pair_durations)
         grid_rows = []
-        for view, ours_clip, ref_clip in row_clips:
+        for view, ours_clip, ref_clip in pair_clips:
             ours_extended = extend_clip(ours_clip, total_duration)
             ref_extended = extend_clip(ref_clip, total_duration)
-            grid_rows.append([ours_extended, ref_extended])
-            grid_components.extend([ours_extended, ref_extended])
+
+            ours_label = f"View {view} - Ours"
+            ref_label = f"View {view} - Reference"
+            ours_annotated, ours_aux = annotate_clip(ours_extended, ours_label)
+            ref_annotated, ref_aux = annotate_clip(ref_extended, ref_label)
+
+            grid_rows.append([ours_annotated, ref_annotated])
+            closeables.extend(
+                [ours_extended, ref_extended, ours_annotated, ref_annotated]
+            )
+            closeables.extend(ours_aux)
+            closeables.extend(ref_aux)
 
         grid = clips_array(grid_rows)
-        fps = _clip_fps(row_clips[0][1])
+        closeables.append(grid)
+
+        if title_template is None:
+            title_text = case_name
+        else:
+            template = title_template.strip()
+            if not template:
+                title_text = case_name
+            elif "{case" in template:
+                try:
+                    title_text = template.format(case=case_name)
+                except KeyError as exc:
+                    raise KeyError(
+                        f"Unknown placeholder {{{exc.args[0]}}} in title template: {title_template}"
+                    ) from exc
+            else:
+                title_text = f"{template} {case_name}".strip()
+        final_clip, title_aux = add_title_bar(grid, title_text)
+        closeables.extend(title_aux)
+        if final_clip is not grid:
+            closeables.append(final_clip)
+
+        fps = _clip_fps(final_clip)
 
         ensure_dir(output_dir)
-        output_path = output_dir / f"{case_name}.mp4"
+        output_filename = f"{case_name}_{RUN_TIMESTAMP}.mp4"
+        output_path = output_dir / output_filename
         LOGGER.info("Rendering %s -> %s", case_name, output_path)
-        grid.write_videofile(
+        final_clip.write_videofile(
             str(output_path),
             codec="libx264",
             audio=False,
@@ -185,11 +318,18 @@ def process_case(case_dir: Path, output_dir: Path) -> None:
             threads=4,
         )
     finally:
-        close_clip(grid)
-        for clip in grid_components:
+        cleanup: List[Optional[VideoClip]] = [final_clip, grid, *closeables]
+        seen: set[int] = set()
+        for clip in cleanup:
+            if clip is None:
+                continue
+            clip_id = id(clip)
+            if clip_id in seen:
+                continue
+            seen.add(clip_id)
             close_clip(clip)
         # Close all open clips to release file handles.
-        for _, ours_clip, ref_clip in row_clips:
+        for _, ours_clip, ref_clip in pair_clips:
             close_clip(ours_clip)
             close_clip(ref_clip)
         for clip in raw_clips:
@@ -212,9 +352,22 @@ def main() -> None:
         default=OUTPUT_ROOT,
         help="Directory to store the composed comparison videos.",
     )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default="Comparison for",
+        help=(
+            "Title prefix rendered above each comparison video. "
+            "Include {case} to control placement explicitly; otherwise the case name is appended."
+        ),
+    )
     args = parser.parse_args()
 
-    output_dir = args.output_dir if args.output_dir.is_absolute() else Path.cwd() / args.output_dir
+    output_dir = (
+        args.output_dir
+        if args.output_dir.is_absolute()
+        else Path.cwd() / args.output_dir
+    )
     ensure_dir(output_dir)
 
     case_dirs = iter_cases(args.cases)
@@ -223,7 +376,7 @@ def main() -> None:
         return
 
     for case_dir in case_dirs:
-        process_case(case_dir, output_dir)
+        process_case(case_dir, output_dir, args.title)
 
 
 if __name__ == "__main__":

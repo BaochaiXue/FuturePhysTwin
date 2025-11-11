@@ -27,6 +27,9 @@ import shutil
 from typing import Iterable, Sequence
 import time
 
+DEFAULT_COLOR_TRAIN_FRAMES = None
+DEFAULT_COLOR_TRAIN_CAMS = None
+
 
 def run_command(
     command: Sequence[str], max_attempts: int = 3, sleep_time: float = 2.0
@@ -144,6 +147,23 @@ def main() -> None:
         type=str,
         default="init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0",
         help="Experiment suffix appended to each model directory.",
+    )
+    parser.add_argument(
+        "--color_train_frames",
+        nargs="+",
+        type=int,
+        default=DEFAULT_COLOR_TRAIN_FRAMES,
+        help=(
+            "Frame indices forwarded to dynamic_fast_color via --train_frames "
+            "(multiple values are joined with commas)."
+        ),
+    )
+    parser.add_argument(
+        "--color_train_cams",
+        nargs="+",
+        type=int,
+        default=DEFAULT_COLOR_TRAIN_CAMS,
+        help="Camera indices forwarded to dynamic_fast_color via --train_cams.",
     )
     args = parser.parse_args()
 
@@ -270,25 +290,13 @@ def main() -> None:
 
         lbs_dir = model_dir / "lbs"
         ensure_dir(lbs_dir)
-        motion_sources = [
-            (
-                root / "experiments" / scene_name / "inference.pkl",
-                "inference.pkl",
-            ),
-            (
-                root
-                / "data"
-                / "different_types"
-                / scene_name
-                / "track_process_data.pkl",
-                "track_process_data.pkl",
-            ),
-        ]
-        for src_path, target_name in motion_sources:
-            if src_path.is_file():
-                shutil.copy2(src_path, lbs_dir / target_name)
-            else:
-                print(f"[LBS] Warning: {src_path} not found; skipping copy.")
+        inference_src = root / "experiments" / scene_name / "inference.pkl"
+        if inference_src.is_file():
+            shutil.copy2(inference_src, lbs_dir / "inference.pkl")
+        else:
+            raise RuntimeError(
+                f"[LBS] Required inference pickle missing: {inference_src}"
+            )
 
         motion_source = lbs_dir / "inference.pkl"
         pose_cache_path = model_dir / "lbs_pose_cache.pt"
@@ -340,9 +348,12 @@ def main() -> None:
                 "colour stage will run without pose deformation."
             )
         color_command.extend(["--frames_dir", str(data_dir)])
-        color_command.extend(["--train_frames", "115"])
-        color_command.append("--train_cams")
-        color_command.extend(str(cam) for cam in [0])
+        if args.color_train_frames:
+            frame_spec = ",".join(str(frame) for frame in args.color_train_frames)
+            color_command.extend(["--train_frames", frame_spec])
+        if args.color_train_cams:
+            color_command.append("--train_cams")
+            color_command.extend(str(cam) for cam in args.color_train_cams)
         color_command.extend(["--viz_every", "1000"])
         run_command(color_command)
         final_models.append((scene_dir, scene_name, model_dir / "color_refine"))

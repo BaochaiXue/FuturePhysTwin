@@ -888,9 +888,6 @@ def training(
                 # Suppress gradients in regions flagged as occluded by preprocessing.
                 occ_mask_tensor = viewpoint_cam.occ_mask.cuda()
                 inv_occ_mask_tensor = 1.0 - occ_mask_tensor
-
-                image *= inv_occ_mask_tensor.unsqueeze(0)
-                pred_seg *= inv_occ_mask_tensor.unsqueeze(0)
                 if depth is not None:
                     depth *= inv_occ_mask_tensor
                 if normal is not None:
