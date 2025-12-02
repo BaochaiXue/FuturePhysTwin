@@ -226,3 +226,5 @@ tmp_gaussian_output_FIXED
 tmp_results
 compare_visualization_videos
 debug
+sam-3d-objects
+sam2
