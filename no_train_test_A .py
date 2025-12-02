@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import subprocess
 import time
 from dataclasses import dataclass
@@ -8,10 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 import shutil
-import argparse
 
 from moviepy import ColorClip, CompositeVideoClip, TextClip, VideoFileClip, clips_array
-from moviepy.video.VideoClip import VideoClip
 
 
 @dataclass(frozen=True)
@@ -41,7 +40,7 @@ PIPELINE_CONFIGS: tuple[PipelineConfig, ...] = (
         exp_suffix="trainall_alpha",
         train_all_parameter=True,
         mask_pred_with_alpha=True,
-        lbs_refresh_interval=100,
+        lbs_refresh_interval=1000,
         video_label="TrainAll + Alpha",
     ),
     PipelineConfig(
@@ -50,7 +49,7 @@ PIPELINE_CONFIGS: tuple[PipelineConfig, ...] = (
         exp_suffix="trainall_occ",
         train_all_parameter=True,
         mask_pred_with_alpha=False,
-        lbs_refresh_interval=100,
+        lbs_refresh_interval=1000,
         video_label="TrainAll + Occ",
     ),
     PipelineConfig(
@@ -106,7 +105,7 @@ def run_command(
 
 
 def render_white_video(exp_name: str) -> None:
-    """Render white-background outputs for ``exp_name`` using gs_run_simulate_white."""
+    """Render white-background videos for ``exp_name`` using gs_run_simulate_white."""
 
     run_command(
         [
@@ -127,20 +126,22 @@ def render_white_video(exp_name: str) -> None:
 
 
 def resolve_white_video(case: str, view: str) -> Path:
-    """Return the path to the freshly rendered white-background video."""
+    """Locate the freshly rendered white-background video for ``case``/``view``."""
 
     candidate = WHITE_OUTPUT_DIR / case / f"{view}.mp4"
     if candidate.exists():
         return candidate
+
     fallback = FALLBACK_WHITE_OUTPUT_DIR / case / f"{view}.mp4"
     if fallback.exists():
         return fallback
+
     raise FileNotFoundError(
-        f"White-background video missing; expected {candidate} or {fallback}"
+        f"White-background video missing; looked for {candidate} and {fallback}"
     )
 
 
-def rename_video(case: str, suffix: str, view: str) -> Path:
+def rename_video(case: str, exp_name: str, suffix: str, view: str) -> Path:
     """Copy the latest experiment video into compare dir with ``suffix``."""
 
     src = resolve_white_video(case, view)
@@ -162,60 +163,34 @@ def rename_video(case: str, suffix: str, view: str) -> Path:
     return dst
 
 
-def build_dynamic_fast_gs_command(config: PipelineConfig) -> list[str]:
-    """Return the CLI invocation for dynamic_fast_gs.py."""
-
-    exp_name = f"{BASE_EXP_NAME}_{config.exp_suffix}"
-    command = [
-        "python",
-        "dynamic_fast_gs.py",
-        "--exp_name",
-        exp_name,
-    ]
-    if config.train_all_parameter:
-        command.append("--train_all_parameter")
-        if config.lbs_refresh_interval > 0:
-            command.extend(["--lbs_refresh_interval", str(config.lbs_refresh_interval)])
-    if config.mask_pred_with_alpha:
-        command.append("--mask_pred_with_alpha")
-
-    return command
-
-
 def run_pipeline(config: PipelineConfig, cases: Sequence[str]) -> dict[str, dict[str, Path]]:
-    """Run the full training/evaluation/video pipeline for ``config``."""
+    """Run the white rendering pipeline and collect videos per case/view."""
 
-    run_command(build_dynamic_fast_gs_command(config))
     exp_name = f"{BASE_EXP_NAME}_{config.exp_suffix}"
     render_white_video(exp_name)
-    run_command(["python", "final_eval.py", "--exp_name", exp_name])
-
     outputs: dict[str, dict[str, Path]] = {case: {} for case in cases}
     for case in cases:
         for view in WHITE_VIEWS:
-            outputs[case][view] = rename_video(case, config.name_suffix, view)
+            outputs[case][view] = rename_video(case, exp_name, config.name_suffix, view)
     return outputs
 
 
 def add_label_overlay(
-    clip: VideoFileClip | VideoClip, label: str
-) -> CompositeVideoClip | VideoClip:
+    clip: VideoFileClip, label: str
+) -> CompositeVideoClip | VideoFileClip:
     if not label:
         return clip
 
     duration = clip.duration
     base_fps = getattr(clip, "fps", 30) or 30
-    height = int(getattr(clip, "h", 0) or 0)
-    width = int(getattr(clip, "w", 0) or 0)
-    font_size = max(24, height // 18 if height else 24)
-    text_width = int(width * 0.8) if width else None
+    font_size = max(24, clip.h // 18)
     text_clip = (
         TextClip(
             text=label,
             font_size=font_size,
             color="white",
             method="caption",
-            size=(text_width, None),
+            size=(int(clip.w * 0.8), None),
             text_align="left",
         )
         .with_duration(duration)
@@ -299,14 +274,14 @@ def collect_existing_videos(case: str, view: str) -> list[tuple[Path, str]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run training/eval pipeline and compose 2×2 comparison videos."
+        description="Run evaluation pipeline and compose 2×2 comparison videos."
     )
     parser.add_argument(
         "--compose_only",
         action="store_true",
         help=(
-            "Skip running training/eval and only compose the 2x2 grid "
-            "using previously archived videos."
+            "Skip running final_eval for each config and only compose the 2x2 grid "
+        "using previously archived videos."
         ),
     )
     parser.add_argument(

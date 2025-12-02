@@ -66,6 +66,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._xyz_override: Optional[torch.Tensor] = None
+        self._rotation_override: Optional[torch.Tensor] = None
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -124,11 +126,18 @@ class GaussianModel:
 
     @property
     def get_rotation(self):
-        return self.rotation_activation(self._rotation)
+        rot_source = (
+            self._rotation_override
+            if self._rotation_override is not None
+            else self._rotation
+        )
+        return self.rotation_activation(rot_source)
 
     @property
     def get_xyz(self):
-        return self._xyz
+        return (
+            self._xyz_override if self._xyz_override is not None else self._xyz
+        )
 
     @property
     def get_features(self):
@@ -159,8 +168,13 @@ class GaussianModel:
             return self.pretrained_exposures[image_name]
 
     def get_covariance(self, scaling_modifier=1):
+        rot_param = (
+            self._rotation_override
+            if self._rotation_override is not None
+            else self._rotation
+        )
         return self.covariance_activation(
-            self.get_scaling, scaling_modifier, self._rotation
+            self.get_scaling, scaling_modifier, rot_param
         )
 
     def get_normal(self, dir_pp_normalized=None):
@@ -728,29 +742,21 @@ class GaussianModel:
         for param in (self._xyz, self._rotation, self._scaling):
             param.requires_grad_(False)
 
-    @torch.no_grad()
-    def _apply_deformed_pose(self, xyz_t: torch.Tensor, rot_t: torch.Tensor) -> None:
-        if xyz_t.shape != self._xyz.shape:
-            raise ValueError("xyz_t shape mismatch.")
-        if rot_t.shape != self._rotation.shape:
-            raise ValueError("rot_t shape mismatch.")
-        self._xyz.copy_(xyz_t)
-        self._rotation.copy_(rot_t)
-
     @contextmanager
     def deform_ctx(self, xyz_t: torch.Tensor, rot_t: torch.Tensor):
         """
         Temporarily replace the model geometry with a deformed pose.
         """
 
-        xyz_bak = self._xyz.clone()
-        rot_bak = self._rotation.clone()
-        self._apply_deformed_pose(xyz_t, rot_t)
+        xyz_prev = self._xyz_override
+        rot_prev = self._rotation_override
+        self._xyz_override = xyz_t
+        self._rotation_override = rot_t
         try:
             yield
         finally:
-            self._xyz.copy_(xyz_bak)
-            self._rotation.copy_(rot_bak)  # ？
+            self._xyz_override = xyz_prev
+            self._rotation_override = rot_prev
 
     # def add_densification_stats(self, viewspace_point_tensor, update_filter):
     #     self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

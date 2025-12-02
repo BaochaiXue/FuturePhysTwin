@@ -7,10 +7,11 @@ Inputs
 ------
 - Canonical frame data at ``ModelParams.source_path`` (Stage A frame) plus every additional frame directory discovered via ``--frames_dir`` (e.g. ``per_frame_gaussian_data/<frame>/<scene>/``), providing per-frame RGB, depth, masks, ``camera_meta.pkl``, and ``observation.ply``.
 - Canonical Gaussian checkpoint ``<model_path>/canonical_gaussians.npz`` (fallback) or ``color_refine/canonical_gaussians_color.npz`` when resuming a previous colour run; this supplies the shared Gaussian kernels (xyz/scaling/rotation/SH/opacity).
-- Optional offline pose cache ``<model_path>/lbs_pose_cache.pt`` produced by
-  ``precompute_lbs_pose_cache.py``. When unavailable the legacy ``lbs_data.pt``
-  bundle (containing bones/weights/motions) can still be used as a fallback for
-  online LBS deformation.
+- Offline pose cache ``<model_path>/lbs_pose_cache.pt`` produced by
+  ``precompute_lbs_pose_cache.py``. This file is now mandatory for colour
+  refinement: colour-only mode samples its cached ``posed_xyz/quat`` per frame,
+  while ``--train_all_parameter`` additionally reuses the stored bones, weights,
+  and motions to perform gradient-friendly LBS deformation.
 
 Outputs
 -------
@@ -35,7 +36,8 @@ from PIL import Image, ImageDraw, ImageFont
 import re
 from gaussian_splatting.arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_splatting.gaussian_renderer import render, network_gui
-from gaussian_splatting.skinning import LBSDeformer
+from gaussian_splatting.skinning import LBSDeformer, build_skinning_weights
+from gaussian_splatting.dynamic_utils import compute_bone_transforms
 from gaussian_splatting.scene import GaussianModel, Scene
 from gaussian_splatting.scene.dataset_readers import readQQTTSceneInfo
 from gaussian_splatting.utils.canonical_io import dump_gaussian_npz, load_canonical_npz
@@ -502,6 +504,11 @@ def training(
     viz_root: Optional[Path] = None,
     train_frames: Optional[set[int]] = None,
     train_cams: Optional[set[int]] = None,
+    train_all_parameter: bool = False,
+    mask_pred_with_alpha: bool = False,
+    lbs_refresh_interval: int = 0,
+    train_all_bbox_pad: float = 0.25,
+    lambda_alpha_leak: float = 0.1,
 ) -> None:
     """
     Run the full Gaussian optimisation loop for a preprocessed QQTT scene.
@@ -525,6 +532,11 @@ def training(
     pose_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
     canonical_xyz_ref: Optional[torch.Tensor] = None
     canonical_rot_ref: Optional[torch.Tensor] = None
+    bone_transform_cache: Optional[torch.Tensor] = None
+    lbs_bones0: Optional[torch.Tensor] = None
+    lbs_relations_cache: Optional[torch.Tensor] = None
+    bone_positions: Optional[torch.Tensor] = None
+    skin_k: Optional[int] = None
 
     first_iter: int = 0
     # Create the output folder structure and, if available, a TensorBoard writer.
@@ -547,6 +559,14 @@ def training(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     should_freeze_geometry = color_only or freeze_geometry
+    if train_all_parameter:
+        should_freeze_geometry = False
+
+    if lbs_path is not None:
+        print(
+            "[LBS] Warning: --lbs_path is deprecated; the colour stage now "
+            "requires an offline pose cache and ignores lbs_data.pt"
+        )
 
     if color_only:
         canonical_color_path = (
@@ -570,8 +590,11 @@ def training(
         assign_canonical_parameters(gaussians, canonical_data)
         if should_freeze_geometry:
             gaussians.freeze_geometry()
-        feature_lr = opt.feature_lr
-        rest_lr = opt.feature_lr / 20.0
+        # When jointly training geometry (--train_all_parameter), reduce all
+        # colour-stage learning rates to stabilise optimisation.
+        lr_scale = 0.2 if train_all_parameter else 1.0
+        feature_lr = opt.feature_lr * lr_scale
+        rest_lr = (opt.feature_lr / 20.0) * lr_scale
         param_groups = [
             {"params": [gaussians._features_dc], "lr": feature_lr, "name": "f_dc"},
             {
@@ -581,17 +604,53 @@ def training(
             },
             {"params": [gaussians._opacity], "lr": opt.opacity_lr, "name": "opacity"},
         ]
+        if train_all_parameter:
+            xyz_lr = opt.position_lr_init * gaussians.spatial_lr_scale
+            param_groups.extend(
+                [
+                    {
+                        "params": [gaussians._xyz],
+                        "lr": xyz_lr * lr_scale,
+                        "name": "xyz",
+                    },
+                    {
+                        "params": [gaussians._scaling],
+                        "lr": opt.scaling_lr * lr_scale,
+                        "name": "scaling",
+                    },
+                    {
+                        "params": [gaussians._rotation],
+                        "lr": opt.rotation_lr * lr_scale,
+                        "name": "rotation",
+                    },
+                ]
+            )
         gaussians.optimizer = torch.optim.Adam(param_groups)
         gaussians.exposure_optimizer = torch.optim.Adam(
-            [{"params": [gaussians._exposure], "name": "exposure"}]
+            [
+                {
+                    "params": [gaussians._exposure],
+                    "lr": opt.feature_lr * lr_scale,
+                    "name": "exposure",
+                }
+            ]
         )
-        if lbs_pose_cache is not None:
-            cache_payload = torch.load(lbs_pose_cache, map_location="cpu")
-            cache_dict = cache_payload.get("pose_cache")
-            if cache_dict is None:
-                raise KeyError(
-                    f"{lbs_pose_cache} does not contain a 'pose_cache' entry."
-                )
+        pose_cache_path = (
+            lbs_pose_cache
+            if lbs_pose_cache is not None
+            else canonical_dir / "lbs_pose_cache.pt"
+        )
+        if not pose_cache_path.is_file():
+            raise FileNotFoundError(
+                "Pose cache required for colour refinement but not found at "
+                f"{pose_cache_path}. Pass --lbs_pose_cache or run "
+                "precompute_lbs_pose_cache.py to generate it."
+            )
+        cache_payload = torch.load(pose_cache_path, map_location="cpu")
+        cache_dict = cache_payload.get("pose_cache")
+        if cache_dict is None:
+            raise KeyError(f"{pose_cache_path} does not contain a 'pose_cache' entry.")
+        if should_freeze_geometry:
             pose_cache = {
                 int(frame_id): (
                     entry["xyz"].to("cuda").float(),
@@ -600,25 +659,73 @@ def training(
                 for frame_id, entry in cache_dict.items()
             }
             print(
-                f"[LBS] Loaded offline pose cache with {len(pose_cache)} frames "
-                f"from {lbs_pose_cache}"
+                f"[LBS] Loaded offline pose cache with {len(pose_cache)} frames from "
+                f"{pose_cache_path}"
             )
             canonical_xyz_ref = gaussians.get_xyz_canonical().detach().clone()
             canonical_rot_ref = gaussians.get_rotation_canonical().detach().clone()
-        elif lbs_path is not None:
-            lbs_payload = load_lbs_data(lbs_path)
-            lbs_deformer = LBSDeformer(
-                lbs_payload["bones0"],
-                lbs_payload["relations"],
-                lbs_payload["skin_indices"],
-                lbs_payload["skin_weights"],
-            )
-            lbs_motions = lbs_payload["motions"]
+        cache_bones0 = cache_payload.get("bones0")
+        cache_relations = cache_payload.get("relations")
+        cache_weights_idx = cache_payload.get("weights_idx")
+        cache_weights = cache_payload.get("weights")
+        cache_bone_positions = cache_payload.get("bone_positions")
+        cache_bone_transforms = cache_payload.get("bone_transforms")
+        if cache_bones0 is not None:
+            lbs_bones0 = cache_bones0.float().to("cuda")
+        if cache_relations is not None:
+            lbs_relations_cache = cache_relations.long().to("cuda")
+        if cache_weights_idx is not None:
+            skin_indices_init = cache_weights_idx.long().to("cuda")
         else:
-            print(
-                "[LBS] Warning: neither --lbs_pose_cache nor --lbs_path provided; "
-                "colour optimisation will run without pose deformation."
+            skin_indices_init = None
+        if cache_weights is not None:
+            skin_weights_init = cache_weights.float().to("cuda")
+            skin_k = cache_weights.shape[1]
+        else:
+            skin_weights_init = None
+        if cache_bone_positions is not None:
+            bone_positions = cache_bone_positions.float().to("cuda")
+        if train_all_parameter:
+            missing_keys: list[str] = []
+            if cache_bones0 is None:
+                missing_keys.append("bones0")
+            if cache_relations is None:
+                missing_keys.append("relations")
+            if cache_weights_idx is None:
+                missing_keys.append("weights_idx")
+            if cache_weights is None:
+                missing_keys.append("weights")
+            if cache_bone_positions is None:
+                missing_keys.append("bone_positions")
+            if missing_keys:
+                raise KeyError(
+                    "Pose cache is missing required entries for train_all_parameter: "
+                    + ", ".join(missing_keys)
+                )
+            if (
+                lbs_bones0 is None
+                or lbs_relations_cache is None
+                or skin_indices_init is None
+                or skin_weights_init is None
+                or bone_positions is None
+            ):
+                raise RuntimeError(
+                    "Pose cache lacks required tensors to instantiate LBSDeformer."
+                )
+            lbs_deformer = LBSDeformer(
+                lbs_bones0,
+                lbs_relations_cache,
+                skin_indices_init,
+                skin_weights_init,
             )
+            lbs_motions = bone_positions - bone_positions[0:1]
+            if cache_bone_transforms is not None:
+                bone_transform_cache = cache_bone_transforms.float().to("cuda")
+            else:
+                print(
+                    "[LBS] Warning: pose cache missing precomputed bone transforms; "
+                    "train_all_parameter will recompute them on-the-fly."
+                )
     elif should_freeze_geometry:
         gaussians.freeze_geometry()
 
@@ -640,6 +747,59 @@ def training(
 
     camera_entries: list[tuple[int, Any]] = []
     seen_paths: set[Path] = set()
+
+    def maybe_refresh_lbs(iteration: int) -> None:
+        nonlocal bone_transform_cache
+        if (
+            lbs_refresh_interval <= 0
+            or not train_all_parameter
+            or lbs_deformer is None
+            or bone_positions is None
+            or lbs_bones0 is None
+            or lbs_relations_cache is None
+            or skin_k is None
+        ):
+            return
+        if iteration % lbs_refresh_interval != 0:
+            return
+        print(
+            f"[LBS] Refreshing skinning weights and bone transforms at iteration {iteration}"
+        )
+        with torch.no_grad():
+            canonical_xyz_live = gaussians.get_xyz.detach()
+            new_indices, new_weights = build_skinning_weights(
+                canonical_xyz_live,
+                lbs_bones0,
+                k=skin_k,
+            )
+            lbs_deformer.skin_indices = new_indices.to(
+                device=lbs_bones0.device, dtype=torch.long
+            )
+            lbs_deformer.skin_weights = new_weights.to(
+                device=lbs_bones0.device, dtype=torch.float32
+            )
+            num_frames = bone_positions.shape[0]
+            num_bones = bone_positions.shape[1]
+            if (
+                bone_transform_cache is None
+                or bone_transform_cache.shape[0] != num_frames
+                or bone_transform_cache.shape[1] != num_bones
+            ):
+                bone_transform_cache = torch.zeros(
+                    (num_frames, num_bones, 4, 4),
+                    device=lbs_bones0.device,
+                    dtype=torch.float32,
+                )
+            for frame_id in range(num_frames):
+                motions = bone_positions[frame_id] - bone_positions[0]
+                transforms = compute_bone_transforms(
+                    lbs_bones0,
+                    motions,
+                    lbs_relations_cache,
+                    device=lbs_bones0.device,
+                    step=frame_id,
+                )
+                bone_transform_cache[frame_id] = transforms
 
     def ingest_frame_dir(frame_path: Path) -> None:
         resolved = frame_path.resolve()
@@ -792,7 +952,32 @@ def training(
         # Use either random backgrounds (for regularisation) or the configured constant.
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if color_only and pose_cache is not None:
+        if (
+            color_only
+            and train_all_parameter
+            and lbs_deformer is not None
+            and lbs_motions is not None
+            and 0 <= frame_id < num_motion_frames
+        ):
+            # Use the live (trainable) geometry so gradients can flow back when
+            # train_all_parameter is enabled.
+            xyz_live = gaussians._xyz
+            rot_live = gaussians._rotation
+            motions_t = lbs_motions[frame_id]
+            bone_transform_t: Optional[torch.Tensor] = None
+            if (
+                bone_transform_cache is not None
+                and 0 <= frame_id < bone_transform_cache.shape[0]
+            ):
+                bone_transform_t = bone_transform_cache[frame_id]
+            posed_xyz, posed_rot = lbs_deformer.deform(
+                xyz_live,
+                rot_live,
+                motions_t,
+                bone_transforms=bone_transform_t,
+            )
+            pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
+        elif color_only and pose_cache is not None:
             posed = pose_cache.get(int(frame_id))
             if posed is None:
                 raise KeyError(
@@ -818,19 +1003,6 @@ def training(
                         f"({canonical_frame_idx}). The pose cache likely "
                         "does not align with the colour-only training frames."
                     )
-            pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
-        elif (
-            color_only
-            and lbs_deformer is not None
-            and lbs_motions is not None
-            and 0 <= frame_id < num_motion_frames
-        ):
-            xyz_canonical = gaussians.get_xyz_canonical().to("cuda")
-            rot_canonical = gaussians.get_rotation_canonical().to("cuda")
-            motions_t = lbs_motions[frame_id]
-            posed_xyz, posed_rot = lbs_deformer.deform(
-                xyz_canonical, rot_canonical, motions_t
-            )
             pose_ctx = gaussians.deform_ctx(posed_xyz, posed_rot)
         else:
             pose_ctx = nullcontext()
@@ -873,7 +1045,10 @@ def training(
             viz_gt_raw: Optional[torch.Tensor] = None
             viz_depth_raw: Optional[torch.Tensor] = None
             viz_normal_raw: Optional[torch.Tensor] = None
+
             if should_viz:
+                # Snapshot raw tensors before masks/occlusion adjustments so the
+                # debug dump shows exactly what the renderer produced this step.
                 viz_pred_rgb_raw = image.detach().clone()
                 viz_pred_seg_raw = pred_seg.detach().clone()
                 viz_gt_raw = gt_image.detach().clone()
@@ -897,13 +1072,35 @@ def training(
             if viewpoint_cam.alpha_mask is not None:
                 # Exclude background pixels when masks are provided.
                 alpha_mask_tensor = viewpoint_cam.alpha_mask.cuda()
-                gt_image *= alpha_mask_tensor
-                image = image * alpha_mask_tensor
+            image_l1 = image
+            gt_image_l1 = gt_image
+            if alpha_mask_tensor is not None:
+                gt_image_l1 = gt_image_l1 * alpha_mask_tensor
+
+            pred_mask_tensor: Optional[torch.Tensor] = None
+            if mask_pred_with_alpha and alpha_mask_tensor is not None:
+                pred_mask_tensor = alpha_mask_tensor
+            elif inv_occ_mask_tensor is not None:
+                pred_mask_tensor = inv_occ_mask_tensor
+
+            if pred_mask_tensor is not None:
+                image_l1 = image_l1 * pred_mask_tensor
+
+            # Penalise alpha leaking outside the provided alpha mask to suppress
+            # stray splats in the background. This does not affect cases without
+            # masks or when the weight is zero.
+            if (
+                alpha_mask_tensor is not None
+                and lambda_alpha_leak > 0.0
+                and pred_seg is not None
+            ):
+                alpha_leak = (pred_seg * (1.0 - alpha_mask_tensor)).mean()
+                loss = loss + lambda_alpha_leak * alpha_leak
 
             if should_viz:
-                pred_rgb_masked = image.detach().clone()
+                pred_rgb_masked = image_l1.detach().clone()
                 pred_seg_masked = pred_seg.detach().clone()
-                gt_masked = gt_image.detach().clone()
+                gt_masked = gt_image_l1.detach().clone()
                 depth_masked = depth.detach().clone() if depth is not None else None
                 normal_masked = normal.detach().clone() if normal is not None else None
                 dump_viz(
@@ -941,11 +1138,11 @@ def training(
                 )
 
             # Photometric supervision mixes L1 and SSIM according to lambda_dssim.
-            Ll1 = l1_loss(image, gt_image)
+            Ll1 = l1_loss(image_l1, gt_image_l1)
             if FUSED_SSIM_AVAILABLE and fused_ssim is not None:
-                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                ssim_value = fused_ssim(image_l1.unsqueeze(0), gt_image_l1.unsqueeze(0))
             else:
-                ssim_value = ssim(image, gt_image)
+                ssim_value = ssim(image_l1, gt_image_l1)
 
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
                 1.0 - ssim_value
@@ -1087,6 +1284,8 @@ def training(
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth",
                 )
 
+            maybe_refresh_lbs(iteration)
+
     if color_only:
         color_path = canonical_dir / "color_refine" / "canonical_gaussians_color.npz"
         dump_gaussian_npz(gaussians, color_path)
@@ -1167,6 +1366,15 @@ def main() -> None:
     parser.add_argument("--color_only", action="store_true", default=False)
     parser.add_argument("--freeze_geometry", action="store_true", default=False)
     parser.add_argument(
+        "--train_all_parameter",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable joint optimisation of xyz/scaling/rotation in the colour stage. "
+            "When omitted, only colour and opacity are refined."
+        ),
+    )
+    parser.add_argument(
         "--lbs_path",
         type=Path,
         default=None,
@@ -1195,7 +1403,10 @@ def main() -> None:
         "--lbs_pose_cache",
         type=Path,
         default=None,
-        help="Path to offline LBS cache (.pt) produced by precompute_lbs_pose_cache.py.",
+        help=(
+            "Path to offline LBS cache (.pt) produced by precompute_lbs_pose_cache.py. "
+            "Defaults to <model_path>/lbs_pose_cache.pt when omitted."
+        ),
     )
     parser.add_argument(
         "--viz_every",
@@ -1221,7 +1432,48 @@ def main() -> None:
         default=None,
         help="Output directory for debug visualisations.",
     )
+    parser.add_argument(
+        "--mask_pred_with_alpha",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, multiply predicted RGB by alpha masks (instead of occlusion masks) "
+            "before computing the photometric loss."
+        ),
+    )
+    parser.add_argument(
+        "--lbs_refresh_interval",
+        type=int,
+        default=0,
+        help=(
+            "Rebuild skinning weights and bone transforms every N iterations when "
+            "--train_all_parameter is enabled (0 disables refresh)."
+        ),
+    )
+    parser.add_argument(
+        "--train_all_bbox_pad",
+        type=float,
+        default=0.25,
+        help=(
+            "Padding ratio (relative to canonical AABB extent) used to clamp trainable "
+            "Gaussians when --train_all_parameter is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_alpha_leak",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight for penalising predicted alpha outside the provided alpha mask to reduce stray splats."
+        ),
+    )
     args = parser.parse_args(sys.argv[1:])
+    if args.train_all_parameter:
+        print(
+            "[info] Colour stage will optimise xyz/scaling/rotation in addition to colour/opacity."
+        )
+    else:
+        print("[info] Colour stage restricted to colour + opacity updates.")
     # Always capture the terminal iteration so the final state is stored on disk.
     args.save_iterations.append(args.iterations)
 
@@ -1272,6 +1524,11 @@ def main() -> None:
         viz_root=viz_root,
         train_frames=train_frames,
         train_cams=train_cams,
+        train_all_parameter=args.train_all_parameter,
+        mask_pred_with_alpha=args.mask_pred_with_alpha,
+        lbs_refresh_interval=args.lbs_refresh_interval,
+        train_all_bbox_pad=args.train_all_bbox_pad,
+        lambda_alpha_leak=args.lambda_alpha_leak,
     )
 
     print("\nTraining complete.")

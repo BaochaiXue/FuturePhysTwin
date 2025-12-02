@@ -71,6 +71,12 @@ def main() -> None:
         default=Path("./gaussian_output_video"),
         help="Directory to save output videos (default: ./gaussian_output_video).",
     )
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0",
+        help="Experiment name used in output subdirectories.",
+    )
     args = parser.parse_args()
 
     # Resolve any relative paths with respect to the script location so behaviour matches the shell version.
@@ -103,8 +109,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     video_dir.mkdir(parents=True, exist_ok=True)
 
-    # Experiment name is part of the output path; same as gs_run.sh.
-    exp_name = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
+    exp_name = args.exp_name
 
     # ----------------------------------------------------------------------
     # Step 1: Precompute interpolated camera poses for every scene directory.

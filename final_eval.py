@@ -34,9 +34,12 @@ Outputs for each step are captured under ``logs/<step>.out`` and ``logs/<step>.e
 
 from __future__ import annotations
 
+import os
+import os
 import subprocess
 import sys
 import time
+from argparse import ArgumentParser
 from pathlib import Path
 import shutil
 from typing import Sequence
@@ -44,7 +47,9 @@ from typing import Sequence
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
 
-DEFAULT_EXP_NAME = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
+DEFAULT_EXP_NAME = os.environ.get(
+    "EVAL_EXP_NAME", "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
+)
 DEFAULT_VIEWS: Sequence[str] = ("0", "1", "2")
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "gaussian_data"
 DEFAULT_PREDICTION_DIR = PROJECT_ROOT / "experiments"
@@ -105,157 +110,161 @@ def preprocess_tmp_gaussian_output(
             copy_tree(exp_dir, target_dir)
 
 
-PIPELINE_COMMANDS: Sequence[Sequence[str]] = (
-    ("python", "export_render_eval_data.py"),
-    (
-        "python",
-        "gs_run_simulate.py",
-        "--output_dir",
-        str(OURS_OUTPUT_DIR),
-        "--views",
-        *DEFAULT_VIEWS,
-        "--exp_name",
-        DEFAULT_EXP_NAME,
-        "--data_root",
-        str(DEFAULT_DATA_ROOT),
-        "--gaussian_root",
-        str(OURS_GAUSSIAN_ROOT),
-    ),
-    (
-        "python",
-        "evaluate_chamfer.py",
-        "--prediction_dir",
-        str(DEFAULT_PREDICTION_DIR),
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--output_file",
-        str(OURS_RESULTS_DIR / "final_results.csv"),
-    ),
-    (
-        "python",
-        "evaluate_track.py",
-        "--prediction_path",
-        str(DEFAULT_PREDICTION_DIR),
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--output_file",
-        str(OURS_RESULTS_DIR / "final_track.csv"),
-    ),
-    (
-        "python",
-        "gaussian_splatting/evaluate_render.py",
-        "--render_path",
-        str(DEFAULT_RENDER_PATH),
-        "--human_mask_path",
-        str(DEFAULT_HUMAN_MASK_PATH),
-        "--root_data_dir",
-        str(DEFAULT_DATA_ROOT),
-        "--output_dir",
-        str(OURS_OUTPUT_DIR),
-        "--log_dir",
-        str(OURS_RESULTS_DIR),
-    ),
-    (
-        "python",
-        "gs_run_simulate_white.py",
-        "--output_dir",
-        str(OURS_WHITE_OUTPUT_DIR),
-        "--views",
-        *DEFAULT_VIEWS,
-        "--exp_name",
-        DEFAULT_EXP_NAME,
-        "--data_root",
-        str(DEFAULT_DATA_ROOT),
-        "--gaussian_root",
-        str(OURS_GAUSSIAN_ROOT),
-    ),
-    (
-        "python",
-        "visualize_render_results.py",
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--prediction_dir",
-        str(OURS_WHITE_OUTPUT_DIR),
-        "--human_mask_path",
-        str(DEFAULT_HUMAN_MASK_PATH),
-        "--object_mask_path",
-        str(DEFAULT_RENDER_PATH),
-    ),
-    (
-        "python",
-        "gs_run_simulate.py",
-        "--output_dir",
-        str(ORIGINAL_OUTPUT_DIR),
-        "--views",
-        *DEFAULT_VIEWS,
-        "--exp_name",
-        DEFAULT_EXP_NAME,
-        "--data_root",
-        str(DEFAULT_DATA_ROOT),
-        "--gaussian_root",
-        str(ORIGINAL_GAUSSIAN_ROOT),
-    ),
-    (
-        "python",
-        "evaluate_chamfer.py",
-        "--prediction_dir",
-        str(DEFAULT_PREDICTION_DIR),
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--output_file",
-        str(ORIGINAL_RESULTS_DIR / "final_results.csv"),
-    ),
-    (
-        "python",
-        "evaluate_track.py",
-        "--prediction_path",
-        str(DEFAULT_PREDICTION_DIR),
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--output_file",
-        str(ORIGINAL_RESULTS_DIR / "final_track.csv"),
-    ),
-    (
-        "python",
-        "gaussian_splatting/evaluate_render.py",
-        "--render_path",
-        str(DEFAULT_RENDER_PATH),
-        "--human_mask_path",
-        str(DEFAULT_HUMAN_MASK_PATH),
-        "--root_data_dir",
-        str(DEFAULT_DATA_ROOT),
-        "--output_dir",
-        str(ORIGINAL_OUTPUT_DIR),
-        "--log_dir",
-        str(ORIGINAL_RESULTS_DIR),
-    ),
-    (
-        "python",
-        "gs_run_simulate_white.py",
-        "--output_dir",
-        str(ORIGINAL_WHITE_OUTPUT_DIR),
-        "--views",
-        *DEFAULT_VIEWS,
-        "--exp_name",
-        DEFAULT_EXP_NAME,
-        "--data_root",
-        str(DEFAULT_DATA_ROOT),
-        "--gaussian_root",
-        str(ORIGINAL_GAUSSIAN_ROOT),
-    ),
-    (
-        "python",
-        "visualize_render_results.py",
-        "--base_path",
-        str(DEFAULT_BASE_PATH),
-        "--prediction_dir",
-        str(ORIGINAL_WHITE_OUTPUT_DIR),
-        "--human_mask_path",
-        str(DEFAULT_HUMAN_MASK_PATH),
-        "--object_mask_path",
-        str(DEFAULT_RENDER_PATH),
-    ),
-)
+def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
+    """Return the ordered list of commands composing the evaluation pipeline."""
+
+    resolved_exp_name = exp_name or DEFAULT_EXP_NAME
+    return (
+        ("python", "export_render_eval_data.py"),
+        (
+            "python",
+            "gs_run_simulate.py",
+            "--output_dir",
+            str(OURS_OUTPUT_DIR),
+            "--views",
+            *DEFAULT_VIEWS,
+            "--exp_name",
+            resolved_exp_name,
+            "--data_root",
+            str(DEFAULT_DATA_ROOT),
+            "--gaussian_root",
+            str(OURS_GAUSSIAN_ROOT),
+        ),
+        (
+            "python",
+            "evaluate_chamfer.py",
+            "--prediction_dir",
+            str(DEFAULT_PREDICTION_DIR),
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--output_file",
+            str(OURS_RESULTS_DIR / "final_results.csv"),
+        ),
+        (
+            "python",
+            "evaluate_track.py",
+            "--prediction_path",
+            str(DEFAULT_PREDICTION_DIR),
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--output_file",
+            str(OURS_RESULTS_DIR / "final_track.csv"),
+        ),
+        (
+            "python",
+            "gaussian_splatting/evaluate_render.py",
+            "--render_path",
+            str(DEFAULT_RENDER_PATH),
+            "--human_mask_path",
+            str(DEFAULT_HUMAN_MASK_PATH),
+            "--root_data_dir",
+            str(DEFAULT_DATA_ROOT),
+            "--output_dir",
+            str(OURS_OUTPUT_DIR),
+            "--log_dir",
+            str(OURS_RESULTS_DIR),
+        ),
+        (
+            "python",
+            "gs_run_simulate_white.py",
+            "--output_dir",
+            str(OURS_WHITE_OUTPUT_DIR),
+            "--views",
+            *DEFAULT_VIEWS,
+            "--exp_name",
+            resolved_exp_name,
+            "--data_root",
+            str(DEFAULT_DATA_ROOT),
+            "--gaussian_root",
+            str(OURS_GAUSSIAN_ROOT),
+        ),
+        (
+            "python",
+            "visualize_render_results.py",
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--prediction_dir",
+            str(OURS_WHITE_OUTPUT_DIR),
+            "--human_mask_path",
+            str(DEFAULT_HUMAN_MASK_PATH),
+            "--object_mask_path",
+            str(DEFAULT_RENDER_PATH),
+        ),
+        (
+            "python",
+            "gs_run_simulate.py",
+            "--output_dir",
+            str(ORIGINAL_OUTPUT_DIR),
+            "--views",
+            *DEFAULT_VIEWS,
+            "--exp_name",
+            resolved_exp_name,
+            "--data_root",
+            str(DEFAULT_DATA_ROOT),
+            "--gaussian_root",
+            str(ORIGINAL_GAUSSIAN_ROOT),
+        ),
+        (
+            "python",
+            "evaluate_chamfer.py",
+            "--prediction_dir",
+            str(DEFAULT_PREDICTION_DIR),
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--output_file",
+            str(ORIGINAL_RESULTS_DIR / "final_results.csv"),
+        ),
+        (
+            "python",
+            "evaluate_track.py",
+            "--prediction_path",
+            str(DEFAULT_PREDICTION_DIR),
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--output_file",
+            str(ORIGINAL_RESULTS_DIR / "final_track.csv"),
+        ),
+        (
+            "python",
+            "gaussian_splatting/evaluate_render.py",
+            "--render_path",
+            str(DEFAULT_RENDER_PATH),
+            "--human_mask_path",
+            str(DEFAULT_HUMAN_MASK_PATH),
+            "--root_data_dir",
+            str(DEFAULT_DATA_ROOT),
+            "--output_dir",
+            str(ORIGINAL_OUTPUT_DIR),
+            "--log_dir",
+            str(ORIGINAL_RESULTS_DIR),
+        ),
+        (
+            "python",
+            "gs_run_simulate_white.py",
+            "--output_dir",
+            str(ORIGINAL_WHITE_OUTPUT_DIR),
+            "--views",
+            *DEFAULT_VIEWS,
+            "--exp_name",
+            resolved_exp_name,
+            "--data_root",
+            str(DEFAULT_DATA_ROOT),
+            "--gaussian_root",
+            str(ORIGINAL_GAUSSIAN_ROOT),
+        ),
+        (
+            "python",
+            "visualize_render_results.py",
+            "--base_path",
+            str(DEFAULT_BASE_PATH),
+            "--prediction_dir",
+            str(ORIGINAL_WHITE_OUTPUT_DIR),
+            "--human_mask_path",
+            str(DEFAULT_HUMAN_MASK_PATH),
+            "--object_mask_path",
+            str(DEFAULT_RENDER_PATH),
+        ),
+    )
 
 DEFAULT_RETRIES = 3
 RETRY_SLEEP_SECONDS = 2.0
@@ -340,10 +349,20 @@ def run_command(
 
 
 def main() -> None:
+    parser = ArgumentParser(description="Run the evaluation pipeline end-to-end.")
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default=os.environ.get("EVAL_EXP_NAME", DEFAULT_EXP_NAME),
+        help="Experiment name whose checkpoints are evaluated.",
+    )
+    args = parser.parse_args()
+    exp_name = args.exp_name or DEFAULT_EXP_NAME
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     OURS_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     preprocess_tmp_gaussian_output()
-    for command in PIPELINE_COMMANDS:
+    for command in build_pipeline_commands(exp_name):
         run_command(command)
 
 

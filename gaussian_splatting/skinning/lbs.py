@@ -73,7 +73,6 @@ class LBSDeformer:
             tensor.requires_grad_(False)
             setattr(self, name, tensor)
 
-    @torch.no_grad()
     def deform(
         self,
         xyz0: torch.Tensor,
@@ -81,6 +80,7 @@ class LBSDeformer:
         motions_t: torch.Tensor,
         *,
         device: Optional[torch.device] = None,
+        bone_transforms: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Apply LBS to canonical Gaussian centres/rotations.
@@ -123,6 +123,7 @@ class LBSDeformer:
             weights_indices=skin_indices,
             xyz=xyz0,
             quat=quat0_device,
+            bone_transforms=bone_transforms,
         )
 
         return posed_xyz, posed_rot

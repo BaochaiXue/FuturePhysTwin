@@ -35,6 +35,7 @@ import torch
 
 from gaussian_splatting.dynamic_utils import (
     calc_weights_vals_from_indices,
+    compute_bone_transforms,
     get_topk_indices,
     interpolate_motions,
     knn_weights,
@@ -172,6 +173,7 @@ def main() -> None:
     weights = calc_weights_vals_from_indices(bones0, xyz0, weights_idx)
 
     pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    bone_transform_cache = torch.zeros((T, num_bones, 4, 4), dtype=torch.float32)
     cache_dtype = torch.float16 if args.half else torch.float32
     # Prepare containers used for rollout-style accumulation so we can emulate
     # gs_render_dynamics.py and reuse its temporal integration behaviour.
@@ -181,12 +183,23 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     for t in range(T):
+        cur_ctrl = x[t]
+        rel_motions = cur_ctrl - bones0
+        transforms_t = compute_bone_transforms(
+            bones=bones0,
+            motions=rel_motions,
+            relations=relations,
+            device=device,
+            step=t,
+        )
+        bone_transform_cache[t] = transforms_t.detach().cpu().to(dtype=torch.float32)
+
         if t == 0:
             posed_xyz = all_xyz
             posed_quat = all_quat
         else:
             prev_ctrl = prev_x[t].to(device=device, dtype=torch.float32)
-            cur_ctrl = x[t].to(device=device, dtype=torch.float32)
+            cur_ctrl = cur_ctrl.to(device=device, dtype=torch.float32)
             motions_t = cur_ctrl - prev_ctrl
 
             num_chunks = (all_xyz.shape[0] + chunk_size - 1) // chunk_size
@@ -228,6 +241,8 @@ def main() -> None:
         "weights_idx": weights_idx.detach().cpu().long(),
         "weights": weights.detach().cpu().to(dtype=torch.float32),
         "pose_cache": pose_cache,
+        "bone_positions": x.detach().cpu().to(dtype=torch.float32),
+        "bone_transforms": bone_transform_cache,
         "meta": {
             "frames": T,
             "bones": num_bones,

@@ -165,6 +165,33 @@ def main() -> None:
         default=DEFAULT_COLOR_TRAIN_CAMS,
         help="Camera indices forwarded to dynamic_fast_color via --train_cams.",
     )
+    parser.add_argument(
+        "--train_all_parameter",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, the colour refinement stage also optimises xyz/scaling/rotation. "
+            "Otherwise it only updates colour and opacity."
+        ),
+    )
+    parser.add_argument(
+        "--lbs_refresh_interval",
+        type=int,
+        default=0,
+        help=(
+            "Rebuild LBS bindings every N iterations during colour refinement when "
+            "--train_all_parameter is enabled (0 disables refresh)."
+        ),
+    )
+    parser.add_argument(
+        "--mask_pred_with_alpha",
+        action="store_true",
+        default=False,
+        help=(
+            "Forward --mask_pred_with_alpha to the colour stage so predicted RGBs are "
+            "masked with alpha instead of occlusion maps."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -231,6 +258,7 @@ def main() -> None:
             str(model_dir),
             "--iterations",
             str(args.iterations),
+            "--disable_viewer",
             "--lambda_depth",  # Depth-loss weight.
             "0.001",
             "--lambda_normal",  # Normal-loss weight (disabled).
@@ -331,7 +359,6 @@ def main() -> None:
             "python",
             str(root / "dynamic_fast_color.py"),
             "--color_only",
-            "--freeze_geometry",
             "--source_path",
             str(scene_dir),
             "--model_path",
@@ -339,7 +366,12 @@ def main() -> None:
             "--iterations",
             str(color_iterations),
             "--use_masks",
+            "--disable_viewer",
         ]
+        if args.train_all_parameter:
+            color_command.append("--train_all_parameter")
+        else:
+            color_command.append("--freeze_geometry")
         if pose_cache_path.exists():
             color_command.extend(["--lbs_pose_cache", str(pose_cache_path)])
         else:
@@ -355,6 +387,12 @@ def main() -> None:
             color_command.append("--train_cams")
             color_command.extend(str(cam) for cam in args.color_train_cams)
         color_command.extend(["--viz_every", "1000"])
+        if args.mask_pred_with_alpha:
+            color_command.append("--mask_pred_with_alpha")
+        if args.lbs_refresh_interval > 0:
+            color_command.extend(
+                ["--lbs_refresh_interval", str(args.lbs_refresh_interval)]
+            )
         run_command(color_command)
         final_models.append((scene_dir, scene_name, model_dir / "color_refine"))
 

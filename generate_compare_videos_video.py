@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -40,7 +39,6 @@ OURS_ROOT = SCRIPT_ROOT / "gaussian_output_dynamic_white"
 REFERENCE_ROOT = SCRIPT_ROOT / "tmp_gaussian_output_dynamic_white"
 OUTPUT_ROOT = SCRIPT_ROOT / "compare_visualization_videos"
 CAMERA_VIEWS: Tuple[str, ...] = ("0", "1", "2")
-RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("compare_videos_video")
@@ -306,8 +304,7 @@ def process_case(
         fps = _clip_fps(final_clip)
 
         ensure_dir(output_dir)
-        output_filename = f"{case_name}_{RUN_TIMESTAMP}.mp4"
-        output_path = output_dir / output_filename
+        output_path = output_dir / f"{case_name}.mp4"
         LOGGER.info("Rendering %s -> %s", case_name, output_path)
         final_clip.write_videofile(
             str(output_path),
