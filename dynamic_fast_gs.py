@@ -370,6 +370,9 @@ def main() -> None:
         ]
         if args.train_all_parameter:
             color_command.append("--train_all_parameter")
+            # Optional: keep geometry anchored during train-all colour refinement.
+            # Mirrors the canonical-stage depth supervision weight.
+            color_command.extend(["--lambda_depth", "0.1"])
         else:
             color_command.append("--freeze_geometry")
         if pose_cache_path.exists():

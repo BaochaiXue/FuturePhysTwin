@@ -228,3 +228,6 @@ compare_visualization_videos
 debug
 sam-3d-objects
 sam2
+data_process_sam3d/groundedSAM_checkpoints
+data_process_sam3d/models/weights
+compare_visualization_videos_mesh

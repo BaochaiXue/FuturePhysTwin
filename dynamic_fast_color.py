@@ -1086,6 +1086,7 @@ def training(
             if pred_mask_tensor is not None:
                 image_l1 = image_l1 * pred_mask_tensor
 
+            alpha_leak: Optional[torch.Tensor] = None
             # Penalise alpha leaking outside the provided alpha mask to suppress
             # stray splats in the background. This does not affect cases without
             # masks or when the weight is zero.
@@ -1095,7 +1096,6 @@ def training(
                 and pred_seg is not None
             ):
                 alpha_leak = (pred_seg * (1.0 - alpha_mask_tensor)).mean()
-                loss = loss + lambda_alpha_leak * alpha_leak
 
             if should_viz:
                 pred_rgb_masked = image_l1.detach().clone()
@@ -1147,6 +1147,8 @@ def training(
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
                 1.0 - ssim_value
             )
+            if alpha_leak is not None:
+                loss = loss + lambda_alpha_leak * alpha_leak
 
             Ll1depth_value: float = 0.0
             if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
