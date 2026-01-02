@@ -331,6 +331,7 @@ def get_final_track_data(track_data, controller_threhsold=0.01):
     mask = track_data["controller_mask"]
 
     new_controller_points = controller_points[:, np.where(mask)[0], :]
+    print(f"[debug] {case_name}: controller points after filtering = {len(new_controller_points[0])}")
     assert len(new_controller_points[0]) >= 30
     # Do farthest point sampling on the valid controller points to select the final controller points
     valid_indices = np.arange(len(new_controller_points[0]))

@@ -80,10 +80,19 @@ if __name__ == "__main__":
         train_frame = split["train"][1]
         test_frame = split["test"][1]
 
-        with open(f"{prediction_path}/{case_name}/inference.pkl", "rb") as f:
+        inference_path = f"{prediction_path}/{case_name}/inference.pkl"
+        gt_track_path = f"{base_path}/{case_name}/gt_track_3d.pkl"
+        if not os.path.isfile(inference_path):
+            print(f"[warn] Missing inference.pkl for {case_name}; skipping.")
+            continue
+        if not os.path.isfile(gt_track_path):
+            print(f"[warn] Missing gt_track_3d.pkl for {case_name}; skipping.")
+            continue
+
+        with open(inference_path, "rb") as f:
             vertices = pickle.load(f)
 
-        with open(f"{base_path}/{case_name}/gt_track_3d.pkl", "rb") as f:
+        with open(gt_track_path, "rb") as f:
             gt_track_3d = pickle.load(f)
 
         # Locate the index of corresponding point index in the vertices, if nan, then ignore the points

@@ -5,7 +5,7 @@
 mkdir -p logs
 
 # --- Data Processing ---
-python script_process_data_sam3d.py --case double_lift_sloth_sam3 \
+python script_process_data_sam3d.py \
   > >(tee logs/script_process_data.out) \
   2> >(tee logs/script_process_data.err >&2)
   
