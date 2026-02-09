@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # --- Preparation ---
 # Create log directory
 mkdir -p logs
