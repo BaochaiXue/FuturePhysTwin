@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import multiprocessing as mp
+from multiprocessing.context import BaseContext
 import queue
 import subprocess
 import sys
@@ -38,9 +39,12 @@ _Result = dict[str, object]
 def _configure_line_buffering() -> None:
     # Ensure prompt log flushing even when stdout/stderr are piped.
     for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
         try:
-            stream.reconfigure(line_buffering=True)
-        except Exception:
+            reconfigure(line_buffering=True)
+        except (AttributeError, OSError, ValueError):
             pass
 
 
@@ -69,7 +73,7 @@ def _frame_export_worker_main(task_queue: mp.Queue, result_queue: mp.Queue) -> N
                 frame_idx=int(task["frame_id"]),
                 generate_high_png=False,
             )
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             result_queue.put(
                 {
                     "ok": False,
@@ -88,7 +92,7 @@ class FrameExportWorker:
     frame without killing the whole pipeline.
     """
 
-    def __init__(self, ctx: mp.context.BaseContext) -> None:
+    def __init__(self, ctx: BaseContext) -> None:
         self._ctx = ctx
         self._proc: mp.Process | None = None
         self._task_queue: mp.Queue | None = None
@@ -101,11 +105,12 @@ class FrameExportWorker:
         self.stop()
         self._task_queue = self._ctx.Queue()
         self._result_queue = self._ctx.Queue()
-        self._proc = self._ctx.Process(
+        proc = self._ctx.Process(
             target=_frame_export_worker_main,
             args=(self._task_queue, self._result_queue),
         )
-        self._proc.start()
+        self._proc = proc
+        proc.start()
 
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
@@ -121,7 +126,7 @@ class FrameExportWorker:
         if task_queue is not None:
             try:
                 task_queue.put_nowait(None)
-            except Exception:
+            except (OSError, ValueError, queue.Full):
                 pass
         if proc is not None:
             proc.join(timeout=2.0)
@@ -138,7 +143,7 @@ class FrameExportWorker:
             try:
                 q.close()
                 q.join_thread()
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
     def run_task(self, task: _Task, *, poll: float = 0.2) -> _Result:
@@ -221,7 +226,7 @@ def run_frame_export(
         try:
             worker.start()
             result = worker.run_task(task)
-        except Exception as exc:
+        except (BrokenPipeError, EOFError, OSError, RuntimeError) as exc:
             failure_reason = str(exc)
             worker.stop()
         else:

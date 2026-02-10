@@ -5,11 +5,20 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
+ARCHIVE_RESULT_DIR_NAME = "archive_result"
+DEFAULT_TASK_NAME = "exp_new_data_and_old_data"
+ARCHIVE_OUTPUT_DIRS = (
+    "results",
+    "gaussian_output_video",
+    "gaussian_output_dynamic",
+    "gaussian_output_dynamic_white",
+)
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LOG_DIR = ROOT / "logs"
@@ -91,7 +100,9 @@ def tee_stream(
     return t
 
 
-def run_step(step_name: str, script_path: Path, logs_dir: Path, python_bin: str) -> None:
+def run_step(
+    step_name: str, script_path: Path, logs_dir: Path, python_bin: str
+) -> None:
     if not script_path.exists():
         raise FileNotFoundError(f"Missing script: {script_path}")
 
@@ -138,8 +149,28 @@ def run_step(step_name: str, script_path: Path, logs_dir: Path, python_bin: str)
     print(f"[Pipeline] Finished {step_name}")
 
 
+def get_archive_task_dir(task_name: str) -> Path:
+    archive_task_dir = ROOT / ARCHIVE_RESULT_DIR_NAME / task_name
+    if archive_task_dir.exists():
+        raise RuntimeError(f"Task archive already exists: {archive_task_dir}")
+    return archive_task_dir
+
+
+def archive_outputs(archive_task_dir: Path) -> None:
+    archive_task_dir.parent.mkdir(parents=True, exist_ok=True)
+    archive_task_dir.mkdir(parents=False, exist_ok=False)
+
+    for directory_name in ARCHIVE_OUTPUT_DIRS:
+        source = ROOT / directory_name
+        if not source.exists():
+            continue
+        shutil.move(str(source), str(archive_task_dir / directory_name))
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run full pipeline with tee-style logs.")
+    parser = argparse.ArgumentParser(
+        description="Run full pipeline with tee-style logs."
+    )
     parser.add_argument(
         "--python",
         default=sys.executable,
@@ -150,17 +181,32 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_LOG_DIR),
         help="Directory for .out/.err logs (default: ./logs).",
     )
+    parser.add_argument(
+        "--task-name",
+        default=DEFAULT_TASK_NAME,
+        help="Task name for output archiving (default: exp_new_data_and_old_data).",
+    )
     return parser.parse_args()
+
+
+def normalize_task_name(task_name: str) -> str:
+    normalized = "_".join(task_name.split())
+    if not normalized:
+        raise ValueError("Task name cannot be empty.")
+    return normalized
 
 
 def main() -> int:
     args = parse_args()
+    task_name = normalize_task_name(args.task_name)
+    archive_task_dir = get_archive_task_dir(task_name)
     logs_dir = Path(args.logs_dir).resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         for step_name, script_file in STEPS:
             run_step(step_name, ROOT / script_file, logs_dir, args.python)
+        archive_outputs(archive_task_dir)
     except KeyboardInterrupt:
         print("\n[Pipeline] Interrupted by user.", file=sys.stderr)
         return 130
@@ -168,6 +214,7 @@ def main() -> int:
         print(f"\n[Pipeline] Failed: {exc}", file=sys.stderr)
         return 1
 
+    print(f"[Pipeline] Archived outputs to: {archive_task_dir}")
     print("\n[Pipeline] All steps completed successfully.")
     return 0
 
