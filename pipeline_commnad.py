@@ -11,6 +11,17 @@ import sys
 import threading
 from pathlib import Path
 
+# START_STAGE accepts stage names from STEPS; None starts from the first stage.
+# Mapping to original commands in pipeline_commnad.sh:
+#   script_process_data -> python script_process_data.py
+#   export_video_human_mask -> python export_video_human_mask.py
+#   dynamic_export_gs_data -> python dynamic_export_gs_data.py
+#   script_optimize -> python script_optimize.py
+#   script_train -> python script_train.py
+#   script_inference -> python script_inference.py
+#   dynamic_fast_gs -> python dynamic_fast_gs.py
+#   final_eval -> python final_eval.py
+START_STAGE: str | None = "script_optimize"
 ARCHIVE_RESULT_DIR_NAME = "archive_result"
 DEFAULT_TASK_NAME = "exp_new_data_and_old_data"
 ARCHIVE_OUTPUT_DIRS = (
@@ -186,6 +197,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TASK_NAME,
         help="Task name for output archiving (default: exp_new_data_and_old_data).",
     )
+    stage_names = [step_name for step_name, _ in STEPS]
+    default_start_stage = START_STAGE or stage_names[0]
+    if default_start_stage not in stage_names:
+        raise ValueError(
+            f"Invalid START_STAGE={START_STAGE!r}. Must be one of: {', '.join(stage_names)}"
+        )
+    parser.add_argument(
+        "--start-stage",
+        default=default_start_stage,
+        choices=stage_names,
+        help=(
+            "Stage name to start from (default: first stage). "
+            "Useful to resume a partially completed run."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -204,7 +230,19 @@ def main() -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        for step_name, script_file in STEPS:
+        start_index = next(
+            i for i, (step_name, _) in enumerate(STEPS) if step_name == args.start_stage
+        )
+        if start_index > 0:
+            skipped_steps = ", ".join(step_name for step_name, _ in STEPS[:start_index])
+            print(
+                (
+                    "[Pipeline][Warning] Starting from stage "
+                    f"'{args.start_stage}', skipping earlier stage(s): {skipped_steps}"
+                ),
+                file=sys.stderr,
+            )
+        for step_name, script_file in STEPS[start_index:]:
             run_step(step_name, ROOT / script_file, logs_dir, args.python)
         archive_outputs(archive_task_dir)
     except KeyboardInterrupt:

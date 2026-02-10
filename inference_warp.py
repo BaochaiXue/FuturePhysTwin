@@ -73,19 +73,35 @@ if __name__ == "__main__":
     )
     expected_springs = trainer.simulator.n_springs
 
-    def _extract_epoch(path: str) -> int:
-        match = re.search(r"best_(\\d+)", os.path.basename(path))
-        return int(match.group(1)) if match else -1
+    def _extract_epoch(path: str):
+        basename = os.path.basename(path)
+        match = re.fullmatch(r"best_(\d+)\.pth", basename)
+        return int(match.group(1)) if match else None
 
     candidate_paths = sorted(glob.glob(f"{base_dir}/train/best_*.pth"))
     assert candidate_paths, f"No checkpoint found under {base_dir}/train"
 
     matching_models = []
+    invalid_name_count = 0
+    invalid_checkpoint_count = 0
     for path in candidate_paths:
-        checkpoint = torch.load(path, map_location=cfg.device)
+        epoch = _extract_epoch(path)
+        if epoch is None:
+            invalid_name_count += 1
+            logger.warning(f"Skip {path}: filename does not match best_<epoch>.pth")
+            continue
+
+        try:
+            checkpoint = torch.load(path, map_location=cfg.device)
+        except Exception as exc:
+            invalid_checkpoint_count += 1
+            logger.warning(f"Skip {path}: failed to load checkpoint ({exc})")
+            continue
+
         spring_len = len(checkpoint.get("spring_Y", []))
         if spring_len == expected_springs:
-            matching_models.append((_extract_epoch(path), path))
+            mtime = os.path.getmtime(path)
+            matching_models.append((epoch, mtime, path))
         else:
             logger.warning(
                 f"Skip {path}: checkpoint has {spring_len} springs, expected {expected_springs}"
@@ -93,8 +109,16 @@ if __name__ == "__main__":
 
     assert (
         matching_models
-    ), "No checkpoint matches current topology. Check experiments directory or regenerate models."
-    # Pick the checkpoint with the highest epoch among the matches.
-    matching_models.sort(reverse=True)
-    best_model_path = matching_models[0][1]
+    ), (
+        "No checkpoint matches current topology. "
+        f"candidates={len(candidate_paths)}, invalid_name={invalid_name_count}, "
+        f"invalid_checkpoint={invalid_checkpoint_count}. "
+        "Check experiments directory or regenerate models."
+    )
+    # Pick the checkpoint with the highest epoch and most recent mtime.
+    matching_models.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_epoch, best_mtime, best_model_path = matching_models[0]
+    logger.info(
+        f"Select checkpoint: {best_model_path} (epoch={best_epoch}, mtime={best_mtime})"
+    )
     trainer.test(best_model_path)
