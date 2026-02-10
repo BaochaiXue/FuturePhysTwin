@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -49,6 +50,25 @@ parser.add_argument("--camera_idx", type=int)
 parser.add_argument("--output_path", type=str, default="NONE")
 parser.add_argument("--exclude_mask_info", type=str, default=None)
 parser.add_argument("--exclude_mask_root", type=str, default=None)
+parser.add_argument("--max_detection_trials", type=int, default=5)
+parser.add_argument(
+    "--required_label",
+    type=str,
+    default=None,
+    help=(
+        "Require this label to appear in GroundingDINO detections before accepting "
+        "results. If omitted, auto-require 'hand' when prompt contains hand."
+    ),
+)
+parser.add_argument(
+    "--required_label_min_count",
+    type=int,
+    default=None,
+    help=(
+        "Minimum number of required labels. If omitted and required label is 'hand', "
+        "defaults to 2; otherwise defaults to 1."
+    ),
+)
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -61,6 +81,9 @@ else:
     output_path = args.output_path
 exclude_mask_info_path = args.exclude_mask_info
 exclude_mask_root = args.exclude_mask_root
+max_detection_trials = max(1, args.max_detection_trials)
+required_label_arg = args.required_label
+required_label_min_count_arg = args.required_label_min_count
 
 
 def existDir(dir_path: str) -> None:
@@ -81,6 +104,34 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     if union == 0:
         return 0.0
     return float(intersection) / float(union)
+
+
+def infer_required_label(prompt: str, required_label: Optional[str]) -> Optional[str]:
+    if required_label:
+        return required_label.lower()
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9_]+", prompt.lower()) if t]
+    if "hand" in tokens:
+        return "hand"
+    return None
+
+
+def infer_required_label_min_count(
+    required_label: Optional[str], required_label_min_count: Optional[int]
+) -> int:
+    if required_label is None:
+        return 0
+    if required_label_min_count is not None:
+        return max(1, required_label_min_count)
+    if required_label == "hand":
+        return 2
+    return 1
+
+
+def select_top_indices_by_confidence(
+    indices: List[int], confidences: torch.Tensor, top_k: int
+) -> List[int]:
+    ranked = sorted(indices, key=lambda idx: float(confidences[idx]), reverse=True)
+    return ranked[:top_k]
 
 
 GROUNDING_DINO_CONFIG = (
@@ -148,6 +199,10 @@ frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 inference_state = video_predictor.init_state(video_path=SOURCE_VIDEO_FRAME_DIR)
 
 ann_frame_idx = 0  # the frame index we interact with
+required_label = infer_required_label(TEXT_PROMPT, required_label_arg)
+required_label_min_count = infer_required_label_min_count(
+    required_label, required_label_min_count_arg
+)
 """
 Step 2: Prompt Grounding DINO 1.5 with Cloud API for box coordinates
 """
@@ -156,13 +211,109 @@ Step 2: Prompt Grounding DINO 1.5 with Cloud API for box coordinates
 img_path = os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[ann_frame_idx])
 image_source, image = load_image(img_path)
 
-boxes, confidences, labels = predict(
-    model=grounding_model,
-    image=image,
-    caption=TEXT_PROMPT,
-    box_threshold=BOX_THRESHOLD,
-    text_threshold=TEXT_THRESHOLD,
-)
+boxes = None
+confidences = None
+labels = None
+box_threshold = BOX_THRESHOLD
+text_threshold = TEXT_THRESHOLD
+for trial_idx in range(1, max_detection_trials + 1):
+    trial_boxes, trial_confidences, trial_labels = predict(
+        model=grounding_model,
+        image=image,
+        caption=TEXT_PROMPT,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
+    )
+    box_threshold *= 0.85
+    text_threshold *= 0.85
+    if len(trial_labels) == 0:
+        print(
+            f"[warn] Detection trial {trial_idx}/{max_detection_trials} "
+            f"(frame {ann_frame_idx}) found no boxes."
+        )
+        continue
+
+    if required_label is not None:
+        lower_labels = [label.lower().strip() for label in trial_labels]
+        required_count = sum(label == required_label for label in lower_labels)
+        if required_count < required_label_min_count:
+            print(
+                f"[warn] Detection trial {trial_idx}/{max_detection_trials} "
+                f"(frame {ann_frame_idx}) found {required_count} '{required_label}' "
+                f"labels, need >= {required_label_min_count}. "
+                f"Detected labels: {trial_labels}"
+            )
+            continue
+
+        if required_label == "hand":
+            hand_indices = [
+                idx for idx, label in enumerate(lower_labels) if label == required_label
+            ]
+            non_hand_indices = [
+                idx for idx, label in enumerate(lower_labels) if label != required_label
+            ]
+            if not non_hand_indices:
+                print(
+                    f"[warn] Detection trial {trial_idx}/{max_detection_trials} "
+                    f"(frame {ann_frame_idx}) has no non-hand object label. "
+                    f"Detected labels: {trial_labels}"
+                )
+                continue
+
+            # Prefer a clean object label that doesn't contain the required token.
+            preferred_non_hand_indices = []
+            for idx in non_hand_indices:
+                tokens = [
+                    t
+                    for t in re.split(r"[^a-zA-Z0-9_]+", lower_labels[idx])
+                    if t
+                ]
+                if required_label not in tokens:
+                    preferred_non_hand_indices.append(idx)
+
+            non_hand_source = (
+                preferred_non_hand_indices
+                if preferred_non_hand_indices
+                else non_hand_indices
+            )
+            keep_hand_indices = select_top_indices_by_confidence(
+                hand_indices, trial_confidences, required_label_min_count
+            )
+            keep_non_hand_index = select_top_indices_by_confidence(
+                non_hand_source, trial_confidences, 1
+            )
+            keep_indices = sorted(keep_non_hand_index + keep_hand_indices)
+
+            if len(keep_indices) < len(trial_labels):
+                print(
+                    f"[info] Detection trial {trial_idx}/{max_detection_trials} "
+                    f"keeping top detections for stability. "
+                    f"Selected indices: {keep_indices}"
+                )
+                trial_boxes = trial_boxes[keep_indices]
+                trial_confidences = trial_confidences[keep_indices]
+                trial_labels = [trial_labels[i] for i in keep_indices]
+
+    boxes = trial_boxes
+    confidences = trial_confidences
+    labels = trial_labels
+    print(
+        f"[info] Detection trial {trial_idx}/{max_detection_trials} succeeded "
+        f"on frame {ann_frame_idx}. Labels: {labels}"
+    )
+    break
+
+if boxes is None or confidences is None or labels is None:
+    expected = (
+        f" including at least {required_label_min_count} '{required_label}'"
+        if required_label
+        else ""
+    )
+    raise RuntimeError(
+        "GroundingDINO failed to find valid detections"
+        f"{expected} after {max_detection_trials} trials on frame {ann_frame_idx}. "
+        f"Case={case_name}, camera={camera_idx}, prompt='{TEXT_PROMPT}'"
+    )
 
 # process the box prompt for SAM 2
 h, w, _ = image_source.shape
