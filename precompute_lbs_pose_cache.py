@@ -20,7 +20,8 @@ Outputs
     * ``relations``     – bone adjacency indices (B, K_adj).
     * ``weights_idx``   – Gaussian-to-bone indices (N, K).
     * ``weights``       – Gaussian skinning weights (N, K).
-    * ``pose_cache``    – mapping ``frame_id -> {"xyz": tensor, "quat": tensor}``.
+    * ``pose_caches``   – mapping ``{"rollout","absolute"} -> frame pose dict``.
+    * ``pose_cache``    – legacy alias that defaults to rollout cache when available.
 """
 
 from __future__ import annotations
@@ -88,6 +89,89 @@ def parse_motion_payload(payload: Any) -> Tuple[np.ndarray, np.ndarray]:
     return x, prev_x
 
 
+def build_absolute_pose_cache(
+    *,
+    xyz0: torch.Tensor,
+    quat0: torch.Tensor,
+    bones0: torch.Tensor,
+    relations: torch.Tensor,
+    weights: torch.Tensor,
+    x: torch.Tensor,
+    cache_dtype: torch.dtype,
+    device: torch.device,
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    frame_count = x.shape[0]
+    pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    with torch.no_grad():
+        for frame_id in range(frame_count):
+            motions = x[frame_id] - bones0
+            posed_xyz, posed_quat, _ = interpolate_motions(
+                bones=bones0,
+                motions=motions,
+                relations=relations,
+                weights=weights,
+                xyz=xyz0,
+                quat=quat0,
+                device=device,
+                step=frame_id,
+            )
+            pose_cache[int(frame_id)] = {
+                "xyz": posed_xyz.detach().to(dtype=cache_dtype, device="cpu"),
+                "quat": posed_quat.detach().to(dtype=cache_dtype, device="cpu"),
+            }
+    return pose_cache
+
+
+def build_rollout_pose_cache(
+    *,
+    xyz0: torch.Tensor,
+    quat0: torch.Tensor,
+    relations: torch.Tensor,
+    x: torch.Tensor,
+    prev_x: torch.Tensor,
+    knn_k: int,
+    cache_dtype: torch.dtype,
+    device: torch.device,
+    chunk_size: int = 5_000,
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    frame_count = x.shape[0]
+    pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    all_xyz = xyz0.detach().clone()
+    all_quat = quat0.detach().clone()
+
+    with torch.no_grad():
+        for frame_id in range(frame_count):
+            if frame_id > 0:
+                prev_ctrl = prev_x[frame_id].to(device=device, dtype=torch.float32)
+                cur_ctrl = x[frame_id].to(device=device, dtype=torch.float32)
+                motions = cur_ctrl - prev_ctrl
+                num_chunks = (all_xyz.shape[0] + chunk_size - 1) // chunk_size
+                for chunk_id in range(num_chunks):
+                    start = chunk_id * chunk_size
+                    end = min((chunk_id + 1) * chunk_size, all_xyz.shape[0])
+                    xyz_chunk = all_xyz[start:end]
+                    quat_chunk = all_quat[start:end]
+                    weights_dense = knn_weights(prev_ctrl, xyz_chunk, K=knn_k)
+                    xyz_chunk_new, quat_chunk_new, _ = interpolate_motions(
+                        bones=prev_ctrl,
+                        motions=motions,
+                        relations=relations,
+                        weights=weights_dense,
+                        xyz=xyz_chunk,
+                        quat=quat_chunk,
+                        device=device,
+                        step=frame_id,
+                    )
+                    all_xyz[start:end] = xyz_chunk_new
+                    all_quat[start:end] = quat_chunk_new
+
+            pose_cache[int(frame_id)] = {
+                "xyz": all_xyz.detach().to(dtype=cache_dtype, device="cpu"),
+                "quat": all_quat.detach().to(dtype=cache_dtype, device="cpu"),
+            }
+    return pose_cache
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Precompute offline LBS pose cache for colour refinement."
@@ -95,7 +179,22 @@ def main() -> None:
     parser.add_argument("--model_dir", type=Path, required=True)
     parser.add_argument("--inference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--K", type=int, default=16, help="Number of nearest bones per Gaussian.")
+    parser.add_argument(
+        "--K",
+        type=int,
+        default=16,
+        help="Number of nearest bones per Gaussian.",
+    )
+    parser.add_argument(
+        "--pose_cache_modes",
+        nargs="+",
+        choices=("rollout", "absolute"),
+        default=("rollout", "absolute"),
+        help=(
+            "Pose cache variants to precompute. "
+            "Supported: rollout, absolute. Default: both."
+        ),
+    )
     parser.add_argument(
         "--half",
         action="store_true",
@@ -121,6 +220,9 @@ def main() -> None:
 
     if args.K < 1:
         raise ValueError("--K must be a positive integer.")
+    selected_modes = tuple(dict.fromkeys(args.pose_cache_modes))
+    if not selected_modes:
+        raise ValueError("At least one pose cache mode must be selected.")
 
     canonical_path = resolve_canonical_npz(model_dir)
     device = torch.device(
@@ -172,75 +274,60 @@ def main() -> None:
     _, weights_idx = knn_weights_sparse(bones0, xyz0, K=knn_k)
     weights = calc_weights_vals_from_indices(bones0, xyz0, weights_idx)
 
-    pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
     bone_transform_cache = torch.zeros((T, num_bones, 4, 4), dtype=torch.float32)
     cache_dtype = torch.float16 if args.half else torch.float32
-    # Prepare containers used for rollout-style accumulation so we can emulate
-    # gs_render_dynamics.py and reuse its temporal integration behaviour.
-    chunk_size = 5_000
-    all_xyz = xyz0.detach().clone()
-    all_quat = quat0.detach().clone()
+    with torch.no_grad():
+        for frame_id in range(T):
+            rel_motions = x[frame_id] - bones0
+            transforms_t = compute_bone_transforms(
+                bones=bones0,
+                motions=rel_motions,
+                relations=relations,
+                device=device,
+                step=frame_id,
+            )
+            bone_transform_cache[frame_id] = transforms_t.detach().cpu().to(
+                dtype=torch.float32
+            )
+            if (frame_id + 1) % 50 == 0 or frame_id == T - 1:
+                print(f"[LBS] Processed frame {frame_id + 1}/{T} for bone transforms")
 
-    torch.set_grad_enabled(False)
-    for t in range(T):
-        cur_ctrl = x[t]
-        rel_motions = cur_ctrl - bones0
-        transforms_t = compute_bone_transforms(
-            bones=bones0,
-            motions=rel_motions,
+    pose_caches: Dict[str, Dict[int, Dict[str, torch.Tensor]]] = {}
+    if "rollout" in selected_modes:
+        print("[LBS] Building rollout pose cache")
+        pose_caches["rollout"] = build_rollout_pose_cache(
+            xyz0=xyz0,
+            quat0=quat0,
             relations=relations,
+            x=x,
+            prev_x=prev_x,
+            knn_k=knn_k,
+            cache_dtype=cache_dtype,
             device=device,
-            step=t,
         )
-        bone_transform_cache[t] = transforms_t.detach().cpu().to(dtype=torch.float32)
+    if "absolute" in selected_modes:
+        print("[LBS] Building absolute pose cache")
+        pose_caches["absolute"] = build_absolute_pose_cache(
+            xyz0=xyz0,
+            quat0=quat0,
+            bones0=bones0,
+            relations=relations,
+            weights=weights,
+            x=x,
+            cache_dtype=cache_dtype,
+            device=device,
+        )
 
-        if t == 0:
-            posed_xyz = all_xyz
-            posed_quat = all_quat
-        else:
-            prev_ctrl = prev_x[t].to(device=device, dtype=torch.float32)
-            cur_ctrl = cur_ctrl.to(device=device, dtype=torch.float32)
-            motions_t = cur_ctrl - prev_ctrl
-
-            num_chunks = (all_xyz.shape[0] + chunk_size - 1) // chunk_size
-            for j in range(num_chunks):
-                start = j * chunk_size
-                end = min((j + 1) * chunk_size, all_xyz.shape[0])
-                xyz_chunk = all_xyz[start:end]
-                quat_chunk = all_quat[start:end]
-                weights_dense = knn_weights(
-                    prev_ctrl,
-                    xyz_chunk,
-                    K=knn_k,
-                )
-                xyz_chunk_new, quat_chunk_new, _ = interpolate_motions(
-                    bones=prev_ctrl,
-                    motions=motions_t,
-                    relations=relations,
-                    weights=weights_dense,
-                    xyz=xyz_chunk,
-                    quat=quat_chunk,
-                    device=device,
-                    step=t,
-                )
-                all_xyz[start:end] = xyz_chunk_new
-                all_quat[start:end] = quat_chunk_new
-
-            posed_xyz = all_xyz
-            posed_quat = all_quat
-        pose_cache[int(t)] = {
-            "xyz": posed_xyz.detach().to(dtype=cache_dtype, device="cpu"),
-            "quat": posed_quat.detach().to(dtype=cache_dtype, device="cpu"),
-        }
-        if (t + 1) % 50 == 0 or t == T - 1:
-            print(f"[LBS] Processed frame {t + 1}/{T}")
+    default_mode = "rollout" if "rollout" in pose_caches else next(iter(pose_caches))
+    legacy_pose_cache = pose_caches[default_mode]
 
     payload: Dict[str, Any] = {
         "bones0": bones0.detach().cpu().to(dtype=torch.float32),
         "relations": relations.detach().cpu().long(),
         "weights_idx": weights_idx.detach().cpu().long(),
         "weights": weights.detach().cpu().to(dtype=torch.float32),
-        "pose_cache": pose_cache,
+        "pose_cache": legacy_pose_cache,
+        "pose_caches": pose_caches,
         "bone_positions": x.detach().cpu().to(dtype=torch.float32),
         "bone_transforms": bone_transform_cache,
         "meta": {
@@ -248,8 +335,14 @@ def main() -> None:
             "bones": num_bones,
             "gaussians": xyz0.shape[0],
             "dtype": str(cache_dtype),
+            "available_pose_modes": list(pose_caches.keys()),
+            "default_pose_mode": default_mode,
         },
     }
+    if "rollout" in pose_caches:
+        payload["pose_cache_rollout"] = pose_caches["rollout"]
+    if "absolute" in pose_caches:
+        payload["pose_cache_absolute"] = pose_caches["absolute"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
     print(f"[LBS] Offline pose cache saved to {output_path}")

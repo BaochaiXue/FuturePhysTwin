@@ -192,6 +192,27 @@ def main() -> None:
             "masked with alpha instead of occlusion maps."
         ),
     )
+    parser.add_argument(
+        "--lbs_pose_mode",
+        type=str,
+        choices=("rollout", "absolute"),
+        default="rollout",
+        help=(
+            "Pose cache variant used by dynamic_fast_color. "
+            "Defaults to rollout for backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--lbs_pose_cache_modes",
+        nargs="+",
+        choices=("rollout", "absolute"),
+        default=None,
+        help=(
+            "Optional pose cache modes forwarded to precompute_lbs_pose_cache.py "
+            "via --pose_cache_modes. Default keeps precompute's behavior "
+            "(generate both rollout and absolute caches)."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -344,6 +365,9 @@ def main() -> None:
                 "--K",
                 "16",
             ]
+            if args.lbs_pose_cache_modes:
+                precompute_command.append("--pose_cache_modes")
+                precompute_command.extend(args.lbs_pose_cache_modes)
             run_command(precompute_command)
         else:
             print(
@@ -375,6 +399,7 @@ def main() -> None:
             color_command.extend(["--lambda_depth", "0.1"])
         else:
             color_command.append("--freeze_geometry")
+        color_command.extend(["--lbs_pose_mode", args.lbs_pose_mode])
         if pose_cache_path.exists():
             color_command.extend(["--lbs_pose_cache", str(pose_cache_path)])
         else:

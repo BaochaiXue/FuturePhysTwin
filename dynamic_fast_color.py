@@ -57,6 +57,8 @@ from gaussian_splatting.utils.loss_utils import (
 from tqdm import tqdm
 import math
 
+POSE_CACHE_MODES = ("rollout", "absolute")
+
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter as SummaryWriterType
 else:
@@ -309,6 +311,49 @@ def _make_bg_patch(
     return bg.view(3, 1, 1).expand(3, height, width)
 
 
+def select_pose_cache(
+    cache_payload: dict[str, Any], pose_mode: str, cache_path: Path
+) -> dict[int, dict[str, torch.Tensor]]:
+    if pose_mode not in POSE_CACHE_MODES:
+        raise ValueError(
+            f"Unsupported pose cache mode '{pose_mode}'. "
+            f"Expected one of {POSE_CACHE_MODES}."
+        )
+
+    pose_caches_raw = cache_payload.get("pose_caches")
+    if isinstance(pose_caches_raw, dict):
+        selected_cache = pose_caches_raw.get(pose_mode)
+        if isinstance(selected_cache, dict):
+            return selected_cache
+
+    legacy_mode_key = f"pose_cache_{pose_mode}"
+    legacy_mode_cache = cache_payload.get(legacy_mode_key)
+    if isinstance(legacy_mode_cache, dict):
+        return legacy_mode_cache
+
+    legacy_default_cache = cache_payload.get("pose_cache")
+    if isinstance(legacy_default_cache, dict):
+        if pose_mode == "rollout":
+            return legacy_default_cache
+        raise KeyError(
+            f"{cache_path} only provides legacy pose_cache (rollout). "
+            f"Requested mode '{pose_mode}' is unavailable."
+        )
+
+    available_modes: set[str] = set()
+    if isinstance(pose_caches_raw, dict):
+        available_modes.update(str(key) for key in pose_caches_raw.keys())
+    if isinstance(cache_payload.get("pose_cache_rollout"), dict):
+        available_modes.add("rollout")
+    if isinstance(cache_payload.get("pose_cache_absolute"), dict):
+        available_modes.add("absolute")
+
+    raise KeyError(
+        f"{cache_path} does not contain pose cache mode '{pose_mode}'. "
+        f"Available modes: {sorted(available_modes) if available_modes else 'none'}"
+    )
+
+
 def dump_viz(
     iteration: int,
     frame_id: int,
@@ -498,6 +543,7 @@ def training(
     lbs_path: Optional[Path] = None,
     frames_dir: Optional[Path] = None,
     lbs_pose_cache: Optional[Path] = None,
+    lbs_pose_mode: str = "rollout",
     viz_every: int = 0,
     viz_frames: Optional[set[int]] = None,
     viz_cams: Optional[set[int]] = None,
@@ -647,9 +693,8 @@ def training(
                 "precompute_lbs_pose_cache.py to generate it."
             )
         cache_payload = torch.load(pose_cache_path, map_location="cpu")
-        cache_dict = cache_payload.get("pose_cache")
-        if cache_dict is None:
-            raise KeyError(f"{pose_cache_path} does not contain a 'pose_cache' entry.")
+        cache_dict = select_pose_cache(cache_payload, lbs_pose_mode, pose_cache_path)
+        print(f"[LBS] Using pose cache mode: {lbs_pose_mode}")
         if should_freeze_geometry:
             pose_cache = {
                 int(frame_id): (
@@ -1411,6 +1456,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--lbs_pose_mode",
+        type=str,
+        choices=POSE_CACHE_MODES,
+        default="rollout",
+        help=(
+            "Pose cache variant to use during colour training. "
+            "Default is rollout for backward compatibility."
+        ),
+    )
+    parser.add_argument(
         "--viz_every",
         type=int,
         default=0,
@@ -1520,6 +1575,7 @@ def main() -> None:
         lbs_path=args.lbs_path,
         frames_dir=args.frames_dir,
         lbs_pose_cache=args.lbs_pose_cache,
+        lbs_pose_mode=args.lbs_pose_mode,
         viz_every=args.viz_every,
         viz_frames=viz_frames,
         viz_cams=viz_cams,
