@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +23,55 @@ STEPS = [
     ("dynamic_fast_gs", "dynamic_fast_gs.py"),
     ("final_eval", "final_eval.py"),
 ]
+
+
+def terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 5.0) -> None:
+    """Best-effort terminate the whole process group for `proc` (POSIX).
+
+    This prevents orphaned GPU/worker processes from surviving step failures.
+    """
+
+    if os.name != "posix":
+        # Fallback: no process-group semantics.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
+
+    pgid = proc.pid  # with start_new_session=True, pgid == pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        # If we can't signal, there's nothing else to do reliably.
+        return
+
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=grace_seconds)
+    except Exception:
+        return
 
 
 def tee_stream(
@@ -46,11 +97,17 @@ def run_step(step_name: str, script_path: Path, logs_dir: Path, python_bin: str)
 
     cmd = [python_bin, str(script_path)]
     print(f"\n[Pipeline] Running {step_name}: {' '.join(cmd)}")
+    env = os.environ.copy()
+    # Force unbuffered stdout/stderr so logs stream in real time even when piped.
+    env["PYTHONUNBUFFERED"] = "1"
+
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
         text=True,
         bufsize=1,
     )
@@ -60,7 +117,18 @@ def run_step(step_name: str, script_path: Path, logs_dir: Path, python_bin: str)
     out_thread = tee_stream(proc.stdout, sys.stdout, logs_dir / f"{step_name}.out")
     err_thread = tee_stream(proc.stderr, sys.stderr, logs_dir / f"{step_name}.err")
 
-    return_code = proc.wait()
+    try:
+        return_code = proc.wait()
+        if return_code != 0:
+            # Ensure no subprocesses linger in this step's process group.
+            terminate_process_group(proc)
+    except KeyboardInterrupt:
+        terminate_process_group(proc)
+        raise
+    except Exception:
+        terminate_process_group(proc)
+        raise
+
     out_thread.join()
     err_thread.join()
 

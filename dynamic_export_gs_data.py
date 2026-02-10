@@ -21,43 +21,142 @@ Outputs
 
 from __future__ import annotations
 
+import csv
 import multiprocessing as mp
 import queue
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Iterable
 
-from export_gaussian_data_one_frame_one_case import (
-    lookup_case_metadata,
-    process_case_frame,
-)
+_Task = dict[str, object]
+_Result = dict[str, object]
 
 
-def _frame_export_worker(
-    error_queue: mp.Queue,
-    *,
-    base_path: Path,
-    output_path: Path,
-    case_name: str,
-    category: str,
-    shape_prior: str,
-    frame_id: int,
-) -> None:
-    try:
-        process_case_frame(
-            base_path=base_path,
-            output_path=output_path,
-            case_name=case_name,
-            category=category,
-            shape_prior=shape_prior,
-            frame_idx=frame_id,
-            generate_high_png=False,
+def _configure_line_buffering() -> None:
+    # Ensure prompt log flushing even when stdout/stderr are piped.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
+def _frame_export_worker_main(task_queue: mp.Queue, result_queue: mp.Queue) -> None:
+    _configure_line_buffering()
+
+    # Import heavy dependencies inside the worker so native failures don't bring down
+    # the parent process. This also reduces per-frame startup overhead vs. spawning
+    # a brand new process per frame.
+    from export_gaussian_data_one_frame_one_case import process_case_frame
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            return
+
+        try:
+            base_path = Path(str(task["base_path"]))
+            output_path = Path(str(task["output_path"]))
+            process_case_frame(
+                base_path=base_path,
+                output_path=output_path,
+                case_name=str(task["case_name"]),
+                category=str(task["category"]),
+                shape_prior=str(task["shape_prior"]),
+                frame_idx=int(task["frame_id"]),
+                generate_high_png=False,
+            )
+        except Exception:
+            result_queue.put(
+                {
+                    "ok": False,
+                    "frame_id": int(task.get("frame_id", -1)),
+                    "error": traceback.format_exc(),
+                }
+            )
+        else:
+            result_queue.put({"ok": True, "frame_id": int(task["frame_id"])})
+
+
+class FrameExportWorker:
+    """A long-lived worker process that exports many frames sequentially.
+
+    If the worker crashes (e.g. SIGSEGV), the parent can restart it and retry the
+    frame without killing the whole pipeline.
+    """
+
+    def __init__(self, ctx: mp.context.BaseContext) -> None:
+        self._ctx = ctx
+        self._proc: mp.Process | None = None
+        self._task_queue: mp.Queue | None = None
+        self._result_queue: mp.Queue | None = None
+
+    def start(self) -> None:
+        if self.is_alive():
+            return
+
+        self.stop()
+        self._task_queue = self._ctx.Queue()
+        self._result_queue = self._ctx.Queue()
+        self._proc = self._ctx.Process(
+            target=_frame_export_worker_main,
+            args=(self._task_queue, self._result_queue),
         )
-    except Exception:
-        error_queue.put(traceback.format_exc())
-        raise
+        self._proc.start()
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.is_alive()
+
+    def stop(self) -> None:
+        proc = self._proc
+        task_queue = self._task_queue
+        result_queue = self._result_queue
+        self._proc = None
+        self._task_queue = None
+        self._result_queue = None
+
+        if task_queue is not None:
+            try:
+                task_queue.put_nowait(None)
+            except Exception:
+                pass
+        if proc is not None:
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2.0)
+
+        for q in (task_queue, result_queue):
+            if q is None:
+                continue
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
+
+    def run_task(self, task: _Task, *, poll: float = 0.2) -> _Result:
+        if not self.is_alive():
+            raise RuntimeError("worker is not running")
+        assert self._task_queue is not None
+        assert self._result_queue is not None
+
+        self._task_queue.put(task)
+        while True:
+            # Detect hard crashes (SIGSEGV etc.) without hanging on queue reads.
+            if self._proc is not None and self._proc.exitcode is not None:
+                raise RuntimeError(f"worker crashed with exitcode {self._proc.exitcode}")
+            try:
+                result = self._result_queue.get(timeout=poll)
+            except queue.Empty:
+                continue
+            return dict(result)
 
 
 def run_command(
@@ -84,13 +183,15 @@ def run_command(
                 cmd_str = " ".join(str(part) for part in cmd)
                 print(
                     f"[warn] Command failed (attempt {attempt}/{attempts}): {cmd_str}\n"
-                    f"       Retrying in {delay:.1f}s… ({exc})"
+                    f"       Retrying in {delay:.1f}s… ({exc})",
+                    flush=True,
                 )
             time.sleep(delay)
 
 
 def run_frame_export(
     *,
+    worker: FrameExportWorker,
     base_path: Path,
     output_path: Path,
     case_name: str,
@@ -101,53 +202,38 @@ def run_frame_export(
     delay: float = 2.0,
 ) -> None:
     """
-    Execute per-frame export in an isolated child process with retries.
+    Execute per-frame export in a persistent worker process with retries.
 
-    Isolation preserves retry behavior when native code crashes (e.g. SIGSEGV).
+    This reduces per-frame process start overhead while still providing isolation:
+    if the worker crashes (e.g. SIGSEGV), it is restarted and the frame retried.
     """
 
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        # Fallback for platforms where "fork" is unavailable.
-        ctx = mp.get_context("spawn")
-
     for attempt in range(1, attempts + 1):
-        error_queue: mp.Queue = ctx.Queue(maxsize=1)
-        proc = ctx.Process(
-            target=_frame_export_worker,
-            args=(error_queue,),
-            kwargs={
-                "base_path": base_path,
-                "output_path": output_path,
-                "case_name": case_name,
-                "category": category,
-                "shape_prior": shape_prior,
-                "frame_id": frame_id,
-            },
-        )
-        proc.start()
-        proc.join()
+        task: _Task = {
+            "base_path": str(base_path),
+            "output_path": str(output_path),
+            "case_name": case_name,
+            "category": category,
+            "shape_prior": shape_prior,
+            "frame_id": frame_id,
+        }
 
-        error_text: str | None = None
         try:
-            error_text = error_queue.get_nowait()
-        except queue.Empty:
-            error_text = None
-        error_queue.close()
-        error_queue.join_thread()
-
-        if proc.exitcode == 0 and error_text is None:
-            return
-
-        if proc.exitcode is None:
-            failure_reason = "child process did not report an exit code"
-        elif proc.exitcode < 0:
-            failure_reason = f"child process crashed with signal {-proc.exitcode}"
-        elif error_text:
-            failure_reason = error_text.strip().splitlines()[-1]
+            worker.start()
+            result = worker.run_task(task)
+        except Exception as exc:
+            failure_reason = str(exc)
+            worker.stop()
         else:
-            failure_reason = f"child process exited with code {proc.exitcode}"
+            if bool(result.get("ok", False)):
+                return
+            error_text = str(result.get("error", "")).strip()
+            failure_reason = (
+                error_text.splitlines()[-1] if error_text else "unknown error"
+            )
+            # Reset the worker on Python exceptions too; native libs can remain in a
+            # bad state after an error.
+            worker.stop()
 
         if attempt == attempts:
             raise RuntimeError(
@@ -158,9 +244,22 @@ def run_frame_export(
         print(
             f"[warn] Frame export failed (attempt {attempt}/{attempts}): "
             f"case={case_name}, frame={frame_id}\n"
-            f"       Retrying in {delay:.1f}s… ({failure_reason})"
+            f"       Retrying in {delay:.1f}s… ({failure_reason})",
+            flush=True,
         )
         time.sleep(delay)
+
+
+def lookup_case_metadata(case_name: str, config_path: Path) -> tuple[str, str]:
+    with config_path.open(newline="", encoding="utf-8") as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            if not row:
+                continue
+            name, category, shape_prior = row[:3]
+            if name == case_name:
+                return category, shape_prior
+    raise ValueError(f"Case '{case_name}' not found in {config_path}")
 
 
 def ensure_dir(path: Path) -> None:
@@ -176,7 +275,10 @@ def collect_frame_ids(case_dir: Path) -> list[int]:
 
     pcd_dir = case_dir / "pcd"
     if not pcd_dir.exists():
-        print(f"Warning: {pcd_dir} missing; skipping case {case_dir.name}.")
+        print(
+            f"Warning: {pcd_dir} missing; skipping case {case_dir.name}.",
+            flush=True,
+        )
         return []
 
     frame_ids: list[int] = []
@@ -206,13 +308,15 @@ def required_assets_exist(
     if missing:
         print(
             f"Skipping frame {frame_id} in {case_dir.name}; missing: "
-            + ", ".join(str(path) for path in missing)
+            + ", ".join(str(path) for path in missing),
+            flush=True,
         )
         return False
     return True
 
 
 def main() -> None:
+    _configure_line_buffering()
     root = Path(__file__).resolve().parent
 
     # Keep the legacy single-frame export to avoid breaking downstream scripts.
@@ -231,16 +335,28 @@ def main() -> None:
 
     required_cams = [0, 1, 2]
 
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        # Fallback for platforms where "fork" is unavailable.
+        ctx = mp.get_context("spawn")
+
     for case_dir in sorted(data_root.iterdir()):
         if not case_dir.is_dir():
             continue
         case_name = case_dir.name
         color_dir = case_dir / "color"
         if not color_dir.exists():
-            print(f"Warning: {color_dir} missing; skipping case {case_name}.")
+            print(
+                f"Warning: {color_dir} missing; skipping case {case_name}.",
+                flush=True,
+            )
             continue
         if any(not (color_dir / str(cam)).exists() for cam in required_cams):
-            print(f"Warning: {case_name} missing required camera folders; skipping.")
+            print(
+                f"Warning: {case_name} missing required camera folders; skipping.",
+                flush=True,
+            )
             continue
 
         frame_ids = collect_frame_ids(case_dir)
@@ -250,25 +366,36 @@ def main() -> None:
         try:
             category, shape_prior = lookup_case_metadata(case_name, config_path)
         except ValueError:
-            print(f"Warning: case {case_name} not found in {config_path}; skipping.")
+            print(
+                f"Warning: case {case_name} not found in {config_path}; skipping.",
+                flush=True,
+            )
             continue
 
-        print(f"Processing case {case_name}: {len(frame_ids)} frames detected.")
-        for frame_id in frame_ids:
-            if not required_assets_exist(case_dir, frame_id, required_cams):
-                continue
+        print(
+            f"Processing case {case_name}: {len(frame_ids)} frames detected.",
+            flush=True,
+        )
+        worker = FrameExportWorker(ctx)
+        try:
+            for frame_id in frame_ids:
+                if not required_assets_exist(case_dir, frame_id, required_cams):
+                    continue
 
-            per_frame_output_dir = per_frame_root / str(frame_id)
-            ensure_dir(per_frame_output_dir)
+                per_frame_output_dir = per_frame_root / str(frame_id)
+                ensure_dir(per_frame_output_dir)
 
-            run_frame_export(
-                base_path=data_root,
-                output_path=per_frame_output_dir,
-                case_name=case_name,
-                category=category,
-                shape_prior=shape_prior,
-                frame_id=frame_id,
-            )
+                run_frame_export(
+                    worker=worker,
+                    base_path=data_root,
+                    output_path=per_frame_output_dir,
+                    case_name=case_name,
+                    category=category,
+                    shape_prior=shape_prior,
+                    frame_id=frame_id,
+                )
+        finally:
+            worker.stop()
 
 
 if __name__ == "__main__":
