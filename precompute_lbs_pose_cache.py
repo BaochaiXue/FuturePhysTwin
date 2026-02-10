@@ -95,26 +95,64 @@ def build_absolute_pose_cache(
     quat0: torch.Tensor,
     bones0: torch.Tensor,
     relations: torch.Tensor,
-    weights: torch.Tensor,
+    weights_idx: torch.Tensor,
+    weights_vals: torch.Tensor,
     x: torch.Tensor,
     cache_dtype: torch.dtype,
     device: torch.device,
+    chunk_size: int = 5_000,
 ) -> Dict[int, Dict[str, torch.Tensor]]:
     frame_count = x.shape[0]
     pose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    n_bones = bones0.shape[0]
+    n_particles = xyz0.shape[0]
+    if weights_idx.shape != weights_vals.shape:
+        raise ValueError(
+            "weights_idx and weights_vals must have the same shape; "
+            f"got {tuple(weights_idx.shape)} vs {tuple(weights_vals.shape)}."
+        )
+    if weights_idx.ndim != 2:
+        raise ValueError(
+            f"weights_idx must have shape (N, K); got {tuple(weights_idx.shape)}."
+        )
+    if weights_idx.shape[0] != n_particles:
+        raise ValueError(
+            "weights_idx first dim must match xyz0; "
+            f"got {weights_idx.shape[0]} vs {n_particles}."
+        )
     with torch.no_grad():
         for frame_id in range(frame_count):
             motions = x[frame_id] - bones0
-            posed_xyz, posed_quat, _ = interpolate_motions(
-                bones=bones0,
-                motions=motions,
-                relations=relations,
-                weights=weights,
-                xyz=xyz0,
-                quat=quat0,
-                device=device,
-                step=frame_id,
-            )
+            posed_xyz = torch.empty_like(xyz0)
+            posed_quat = torch.empty_like(quat0)
+            num_chunks = (n_particles + chunk_size - 1) // chunk_size
+            for chunk_id in range(num_chunks):
+                start = chunk_id * chunk_size
+                end = min((chunk_id + 1) * chunk_size, n_particles)
+                xyz_chunk = xyz0[start:end]
+                quat_chunk = quat0[start:end]
+                idx_chunk = weights_idx[start:end]
+                vals_chunk = weights_vals[start:end]
+                weights_dense = torch.zeros(
+                    (end - start, n_bones), device=device, dtype=torch.float32
+                )
+                weights_dense[
+                    torch.arange(end - start, device=device)[:, None],
+                    idx_chunk,
+                ] = vals_chunk
+                xyz_chunk_new, quat_chunk_new, _ = interpolate_motions(
+                    bones=bones0,
+                    motions=motions,
+                    relations=relations,
+                    weights=weights_dense,
+                    xyz=xyz_chunk,
+                    quat=quat_chunk,
+                    device=device,
+                    step=frame_id,
+                )
+                posed_xyz[start:end] = xyz_chunk_new
+                posed_quat[start:end] = quat_chunk_new
+
             pose_cache[int(frame_id)] = {
                 "xyz": posed_xyz.detach().to(dtype=cache_dtype, device="cpu"),
                 "quat": posed_quat.detach().to(dtype=cache_dtype, device="cpu"),
@@ -272,7 +310,7 @@ def main() -> None:
     if knn_k < 1:
         raise ValueError("K must be >= 1 when bones are present.")
     _, weights_idx = knn_weights_sparse(bones0, xyz0, K=knn_k)
-    weights = calc_weights_vals_from_indices(bones0, xyz0, weights_idx)
+    weights_vals = calc_weights_vals_from_indices(bones0, xyz0, weights_idx)
 
     bone_transform_cache = torch.zeros((T, num_bones, 4, 4), dtype=torch.float32)
     cache_dtype = torch.float16 if args.half else torch.float32
@@ -312,7 +350,8 @@ def main() -> None:
             quat0=quat0,
             bones0=bones0,
             relations=relations,
-            weights=weights,
+            weights_idx=weights_idx,
+            weights_vals=weights_vals,
             x=x,
             cache_dtype=cache_dtype,
             device=device,
@@ -325,7 +364,7 @@ def main() -> None:
         "bones0": bones0.detach().cpu().to(dtype=torch.float32),
         "relations": relations.detach().cpu().long(),
         "weights_idx": weights_idx.detach().cpu().long(),
-        "weights": weights.detach().cpu().to(dtype=torch.float32),
+        "weights": weights_vals.detach().cpu().to(dtype=torch.float32),
         "pose_cache": legacy_pose_cache,
         "pose_caches": pose_caches,
         "bone_positions": x.detach().cpu().to(dtype=torch.float32),

@@ -903,6 +903,27 @@ def training(
     frame_summary: dict[int, int] = {}
     for frame_id, _ in camera_entries:
         frame_summary[frame_id] = frame_summary.get(frame_id, 0) + 1
+    num_motion_frames = lbs_motions.shape[0] if lbs_motions is not None else 0
+    if color_only and train_all_parameter:
+        if num_motion_frames <= 0:
+            raise RuntimeError(
+                "[LBS] --train_all_parameter requires non-empty motion frames, "
+                "but no motion trajectory was loaded from the pose cache."
+            )
+        invalid_frame_ids = sorted(
+            frame_id
+            for frame_id in frame_summary
+            if frame_id < 0 or frame_id >= num_motion_frames
+        )
+        if invalid_frame_ids:
+            preview = ", ".join(str(fid) for fid in invalid_frame_ids[:10])
+            suffix = " ..." if len(invalid_frame_ids) > 10 else ""
+            raise ValueError(
+                "[LBS] Found training frames without motion data for "
+                f"--train_all_parameter: {preview}{suffix}. "
+                f"Motion cache only provides frame ids in [0, {num_motion_frames - 1}]. "
+                "Use --train_frames to constrain sampled frames or regenerate the pose cache."
+            )
     summary_str = ", ".join(
         f"{fid}: {count} cams" for fid, count in sorted(frame_summary.items())
     )
@@ -913,8 +934,6 @@ def training(
     # Rolling averages used solely for smoother console logging.
     ema_loss_for_log: float = 0.0
     ema_l1depth_for_log: float = 0.0
-    num_motion_frames = lbs_motions.shape[0] if lbs_motions is not None else 0
-
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     viz_frames_set = set(viz_frames) if viz_frames is not None else None
@@ -997,13 +1016,17 @@ def training(
         # Use either random backgrounds (for regularisation) or the configured constant.
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if (
-            color_only
-            and train_all_parameter
-            and lbs_deformer is not None
-            and lbs_motions is not None
-            and 0 <= frame_id < num_motion_frames
-        ):
+        if color_only and train_all_parameter:
+            if lbs_deformer is None or lbs_motions is None:
+                raise RuntimeError(
+                    "[LBS] --train_all_parameter requested but LBS deformer/motions are unavailable."
+                )
+            if frame_id < 0 or frame_id >= num_motion_frames:
+                raise KeyError(
+                    f"[LBS] Frame {frame_id} is outside motion range "
+                    f"[0, {num_motion_frames - 1}] in --train_all_parameter mode. "
+                    "Constrain --train_frames or regenerate the pose cache."
+                )
             # Use the live (trainable) geometry so gradients can flow back when
             # train_all_parameter is enabled.
             xyz_live = gaussians._xyz
