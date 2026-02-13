@@ -21,7 +21,7 @@ Outputs
 
 from __future__ import annotations
 
-import csv
+import argparse
 import multiprocessing as mp
 from multiprocessing.context import BaseContext
 import queue
@@ -32,8 +32,22 @@ import traceback
 from pathlib import Path
 from typing import Iterable
 
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_config_rows,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
+
 _Task = dict[str, object]
 _Result = dict[str, object]
+ROOT = Path(__file__).resolve().parent
+DEFAULT_BASE_PATH = "./data/different_types"
+DEFAULT_CONFIG_PATH = "./data_config.csv"
+DEFAULT_PER_FRAME_ROOT = "./per_frame_gaussian_data"
+DEFAULT_LEGACY_OUTPUT_PATH = "./data/gaussian_data"
 
 
 def _configure_line_buffering() -> None:
@@ -255,16 +269,34 @@ def run_frame_export(
         time.sleep(delay)
 
 
-def lookup_case_metadata(case_name: str, config_path: Path) -> tuple[str, str]:
-    with config_path.open(newline="", encoding="utf-8") as csvfile:
-        reader = csv.reader(csvfile)
-        for row in reader:
-            if not row:
-                continue
-            name, category, shape_prior = row[:3]
-            if name == case_name:
-                return category, shape_prior
-    raise ValueError(f"Case '{case_name}' not found in {config_path}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export Gaussian-ready assets per frame for allowed cases."
+    )
+    parser.add_argument("--base-path", default=DEFAULT_BASE_PATH)
+    parser.add_argument("--config-path", default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--per-frame-root", default=DEFAULT_PER_FRAME_ROOT)
+    parser.add_argument("--legacy-output-path", default=DEFAULT_LEGACY_OUTPUT_PATH)
+    return parser.parse_args()
+
+
+def build_case_metadata(config_rows: list[list[str]], config_path: Path) -> dict[str, tuple[str, str]]:
+    case_metadata: dict[str, tuple[str, str]] = {}
+    for row in config_rows:
+        if len(row) < 3:
+            raise ValueError(
+                f"Malformed config row in {config_path}: expected >=3 columns, got {row}"
+            )
+        case_name = row[0].strip()
+        category = row[1].strip()
+        shape_prior = row[2].strip()
+        if case_name in case_metadata:
+            print(
+                f"[CaseFilter][Warning][dynamic_export_gs_data] Duplicate metadata row for '{case_name}' in {config_path}; using first occurrence."
+            )
+            continue
+        case_metadata[case_name] = (category, shape_prior)
+    return case_metadata
 
 
 def ensure_dir(path: Path) -> None:
@@ -322,21 +354,38 @@ def required_assets_exist(
 
 def main() -> None:
     _configure_line_buffering()
-    root = Path(__file__).resolve().parent
+    args = parse_args()
+    root = ROOT
+
+    data_root = resolve_path_from_root(root, args.base_path)
+    config_path = resolve_path_from_root(root, args.config_path)
+    legacy_output_path = resolve_path_from_root(root, args.legacy_output_path)
 
     # Keep the legacy single-frame export to avoid breaking downstream scripts.
-    run_command(["python", str(root / "export_gaussian_data.py")])
+    run_command(
+        [
+            sys.executable,
+            str(root / "export_gaussian_data.py"),
+            "--base-path",
+            str(data_root),
+            "--output-path",
+            str(legacy_output_path),
+            "--config-path",
+            str(config_path),
+        ]
+    )
 
-    config_path = root / "data_config.csv"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+    config_rows = load_config_rows(config_path)
+    config_cases = load_config_cases(config_path)
+    case_metadata = build_case_metadata(config_rows, config_path)
 
-    per_frame_root = root / "per_frame_gaussian_data"
+    per_frame_root = resolve_path_from_root(root, args.per_frame_root)
     ensure_dir(per_frame_root)
-
-    data_root = root / "data" / "different_types"
-    if not data_root.exists():
-        raise FileNotFoundError(f"Data root not found: {data_root}")
+    input_cases = load_input_cases(data_root)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "dynamic_export_gs_data", data_root, config_path
+    )
+    allowed_cases = input_cases & config_cases
 
     required_cams = [0, 1, 2]
 
@@ -346,10 +395,17 @@ def main() -> None:
         # Fallback for platforms where "fork" is unavailable.
         ctx = mp.get_context("spawn")
 
-    for case_dir in sorted(data_root.iterdir()):
-        if not case_dir.is_dir():
-            continue
-        case_name = case_dir.name
+    case_dirs = sorted([path for path in data_root.iterdir() if path.is_dir()])
+    case_dirs_by_name = {case_dir.name: case_dir for case_dir in case_dirs}
+    filtered_case_names = filter_candidates(
+        [case_dir.name for case_dir in case_dirs],
+        allowed_cases,
+        "dynamic_export_gs_data",
+        str(data_root),
+    )
+
+    for case_name in filtered_case_names:
+        case_dir = case_dirs_by_name[case_name]
         color_dir = case_dir / "color"
         if not color_dir.exists():
             print(
@@ -368,14 +424,14 @@ def main() -> None:
         if not frame_ids:
             continue
 
-        try:
-            category, shape_prior = lookup_case_metadata(case_name, config_path)
-        except ValueError:
+        case_meta = case_metadata.get(case_name)
+        if case_meta is None:
             print(
-                f"Warning: case {case_name} not found in {config_path}; skipping.",
+                f"[CaseFilter][Info][dynamic_export_gs_data] Skip non-allowed case '{case_name}' discovered in {data_root}.",
                 flush=True,
             )
             continue
+        category, shape_prior = case_meta
 
         print(
             f"Processing case {case_name}: {len(frame_ids)} frames detected.",

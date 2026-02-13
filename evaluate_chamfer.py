@@ -1,35 +1,56 @@
+from __future__ import annotations
+
 import csv
-import os
-import glob
 import json
 import pickle
-import numpy as np
-import torch
 from argparse import ArgumentParser, Namespace
-from pytorch3d.loss import chamfer_distance
+from pathlib import Path
+
+import numpy as np
+
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_PREDICTION_DIR = "./experiments"
+DEFAULT_BASE_PATH = "./data/different_types"
+DEFAULT_OUTPUT_FILE = "results/final_results.csv"
+DEFAULT_CONFIG_PATH = "./data_config.csv"
 
 
 def parse_args() -> Namespace:
     parser = ArgumentParser(description="Evaluate Chamfer distance for tracked trajectories.")
     parser.add_argument(
         "--prediction_dir",
-        type=str,
-        default="./experiments",
-        help="Directory containing predicted trajectories (default: ./experiments).",
+        type=Path,
+        default=Path(DEFAULT_PREDICTION_DIR),
+        help=f"Directory containing predicted trajectories (default: {DEFAULT_PREDICTION_DIR}).",
     )
     parser.add_argument(
         "--base_path",
-        type=str,
-        default="./data/different_types",
-        help="Directory with ground-truth data (default: ./data/different_types).",
+        type=Path,
+        default=Path(DEFAULT_BASE_PATH),
+        help=f"Directory with ground-truth data (default: {DEFAULT_BASE_PATH}).",
     )
     parser.add_argument(
         "--output_file",
-        type=str,
-        default="results/final_results.csv",
-        help="CSV file to write evaluation results (default: results/final_results.csv).",
+        type=Path,
+        default=Path(DEFAULT_OUTPUT_FILE),
+        help=f"CSV file to write evaluation results (default: {DEFAULT_OUTPUT_FILE}).",
+    )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=Path(DEFAULT_CONFIG_PATH),
+        help=f"Case allowlist CSV path (default: {DEFAULT_CONFIG_PATH}).",
     )
     return parser.parse_args()
+
 
 def evaluate_prediction(
     start_frame,
@@ -41,6 +62,9 @@ def evaluate_prediction(
     num_original_points,
     num_surface_points,
 ):
+    import torch
+    from pytorch3d.loss import chamfer_distance
+
     chamfer_errors = []
 
     if not isinstance(vertices, torch.Tensor):
@@ -56,111 +80,135 @@ def evaluate_prediction(
         x = vertices[frame_idx]
         current_object_points = object_points[frame_idx]
         current_object_visibilities = object_visibilities[frame_idx]
-        # The motion valid indicates if the tracking is valid from prev_frame
         current_object_motions_valid = object_motions_valid[frame_idx - 1]
+        _ = current_object_motions_valid
 
-        # Compute the single-direction chamfer loss for the object points
         chamfer_object_points = current_object_points[current_object_visibilities]
         chamfer_x = x[:num_surface_points]
-        # The GT chamfer_object_points can be partial,first find the nearest in second
         chamfer_error = chamfer_distance(
             chamfer_object_points.unsqueeze(0),
             chamfer_x.unsqueeze(0),
             single_directional=True,
-            norm=1,  # Get the L1 distance
+            norm=1,
         )[0]
 
         chamfer_errors.append(chamfer_error.item())
 
     chamfer_errors = np.array(chamfer_errors)
-
-    results = {
+    return {
         "frame_len": len(chamfer_errors),
         "chamfer_error": np.mean(chamfer_errors),
     }
 
-    return results
+
+def main() -> int:
+    args = parse_args()
+    prediction_dir = resolve_path_from_root(ROOT, args.prediction_dir)
+    base_path = resolve_path_from_root(ROOT, args.base_path)
+    output_file = resolve_path_from_root(ROOT, args.output_file)
+    config_path = resolve_path_from_root(ROOT, args.config_path)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "evaluate_chamfer", base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
+
+    case_dirs = sorted(path for path in prediction_dir.glob("*") if path.is_dir())
+    case_dirs_by_name = {case_dir.name: case_dir for case_dir in case_dirs}
+    filtered_case_names = filter_candidates(
+        [case_dir.name for case_dir in case_dirs],
+        allowed_cases,
+        "evaluate_chamfer",
+        str(prediction_dir),
+    )
+
+    with output_file.open(mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "Case Name",
+                "Train Frame Num",
+                "Train Chamfer Error",
+                "Test Frame Num",
+                "Test Chamfer Error",
+            ]
+        )
+
+        for case_name in filtered_case_names:
+            case_prediction_dir = case_dirs_by_name[case_name]
+            print(f"Processing {case_name}")
+
+            inference_path = case_prediction_dir / "inference.pkl"
+            case_data_dir = base_path / case_name
+            final_data_path = case_data_dir / "final_data.pkl"
+            split_path = case_data_dir / "split.json"
+            if not inference_path.is_file():
+                print(f"[warn] Missing inference.pkl for {case_name}; skipping.")
+                continue
+            if not final_data_path.is_file():
+                print(f"[warn] Missing final_data.pkl for {case_name}; skipping.")
+                continue
+            if not split_path.is_file():
+                print(f"[warn] Missing split.json for {case_name}; skipping.")
+                continue
+
+            with inference_path.open("rb") as f:
+                vertices = pickle.load(f)
+
+            with final_data_path.open("rb") as f:
+                data = pickle.load(f)
+
+            object_points = data["object_points"]
+            object_visibilities = data["object_visibilities"]
+            object_motions_valid = data["object_motions_valid"]
+            num_original_points = object_points.shape[1]
+            num_surface_points = num_original_points + data["surface_points"].shape[0]
+
+            with split_path.open("r", encoding="utf-8") as f:
+                split = json.load(f)
+            train_frame = split["train"][1]
+            test_frame = split["test"][1]
+
+            assert (
+                test_frame == vertices.shape[0]
+            ), f"Test frame {test_frame} != {vertices.shape[0]}"
+
+            results_train = evaluate_prediction(
+                1,
+                train_frame,
+                vertices,
+                object_points,
+                object_visibilities,
+                object_motions_valid,
+                num_original_points,
+                num_surface_points,
+            )
+            results_test = evaluate_prediction(
+                train_frame,
+                test_frame,
+                vertices,
+                object_points,
+                object_visibilities,
+                object_motions_valid,
+                num_original_points,
+                num_surface_points,
+            )
+
+            writer.writerow(
+                [
+                    case_name,
+                    results_train["frame_len"],
+                    results_train["chamfer_error"],
+                    results_test["frame_len"],
+                    results_test["chamfer_error"],
+                ]
+            )
+    return 0
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    prediction_dir = args.prediction_dir
-    base_path = args.base_path
-    output_file = args.output_file
-
-    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-
-    file = open(output_file, mode="w", newline="", encoding="utf-8")
-    writer = csv.writer(file)
-
-    writer.writerow(
-        [
-            "Case Name",
-            "Train Frame Num",
-            "Train Chamfer Error",
-            "Test Frame Num",
-            "Test Chamfer Error",
-        ]
-    )
-
-    dir_names = glob.glob(f"{prediction_dir}/*")
-    for dir_name in dir_names:
-        case_name = dir_name.split("/")[-1]
-        print(f"Processing {case_name}")
-
-        # Read the trajectory data
-        with open(f"{dir_name}/inference.pkl", "rb") as f:
-            vertices = pickle.load(f)
-
-        # Read the GT object points and masks
-        with open(f"{base_path}/{case_name}/final_data.pkl", "rb") as f:
-            data = pickle.load(f)
-
-        object_points = data["object_points"]
-        object_visibilities = data["object_visibilities"]
-        object_motions_valid = data["object_motions_valid"]
-        num_original_points = object_points.shape[1]
-        num_surface_points = num_original_points + data["surface_points"].shape[0]
-
-        # read the train/test split
-        with open(f"{base_path}/{case_name}/split.json", "r") as f:
-            split = json.load(f)
-        train_frame = split["train"][1]
-        test_frame = split["test"][1]
-
-        assert (
-            test_frame == vertices.shape[0]
-        ), f"Test frame {test_frame} != {vertices.shape[0]}"
-
-        # Do the statistics on train split, only evalaute from the 2nd frame
-        results_train = evaluate_prediction(
-            1,
-            train_frame,
-            vertices,
-            object_points,
-            object_visibilities,
-            object_motions_valid,
-            num_original_points,
-            num_surface_points,
-        )
-        results_test = evaluate_prediction(
-            train_frame,
-            test_frame,
-            vertices,
-            object_points,
-            object_visibilities,
-            object_motions_valid,
-            num_original_points,
-            num_surface_points,
-        )
-
-        writer.writerow(
-            [
-                case_name,
-                results_train["frame_len"],
-                results_train["chamfer_error"],
-                results_test["frame_len"],
-                results_test["chamfer_error"],
-            ]
-        )
-    file.close()
+    raise SystemExit(main())

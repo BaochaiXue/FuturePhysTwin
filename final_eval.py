@@ -35,7 +35,6 @@ Outputs for each step are captured under ``logs/<step>.out`` and ``logs/<step>.e
 from __future__ import annotations
 
 import os
-import os
 import subprocess
 import sys
 import time
@@ -43,6 +42,14 @@ from argparse import ArgumentParser
 from pathlib import Path
 import shutil
 from typing import Sequence
+
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -56,6 +63,7 @@ DEFAULT_PREDICTION_DIR = PROJECT_ROOT / "experiments"
 DEFAULT_BASE_PATH = PROJECT_ROOT / "data" / "different_types"
 DEFAULT_RENDER_PATH = PROJECT_ROOT / "data" / "render_eval_data"
 DEFAULT_HUMAN_MASK_PATH = PROJECT_ROOT / "data" / "different_types_human_mask"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "data_config.csv"
 
 ORIGINAL_GAUSSIAN_ROOT_NEED_PREPROCESS = PROJECT_ROOT / "tmp_gaussian_output"
 ORIGINAL_GAUSSIAN_ROOT = PROJECT_ROOT / "tmp_gaussian_output_FIXED"
@@ -84,6 +92,7 @@ def copy_tree(src: Path, dst: Path) -> None:
 def preprocess_tmp_gaussian_output(
     src_root: Path = ORIGINAL_GAUSSIAN_ROOT_NEED_PREPROCESS,
     dst_root: Path = ORIGINAL_GAUSSIAN_ROOT,
+    allowed_cases: set[str] | None = None,
 ) -> None:
     if dst_root.exists():
         print(f"Removing existing preprocessed directory {dst_root}...")
@@ -93,7 +102,18 @@ def preprocess_tmp_gaussian_output(
         return
     dst_root.mkdir(parents=True, exist_ok=True)
     print(f"Preprocessing {src_root} to {dst_root}...")
-    for scene_dir in sorted(p for p in src_root.iterdir() if p.is_dir()):
+    scene_dirs = sorted(p for p in src_root.iterdir() if p.is_dir())
+    if allowed_cases is not None:
+        scene_dirs_by_name = {scene_dir.name: scene_dir for scene_dir in scene_dirs}
+        filtered_scene_names = filter_candidates(
+            [scene_dir.name for scene_dir in scene_dirs],
+            allowed_cases,
+            "final_eval_preprocess_tmp_gaussian_output",
+            str(src_root),
+        )
+        scene_dirs = [scene_dirs_by_name[name] for name in filtered_scene_names]
+
+    for scene_dir in scene_dirs:
         scene_name = scene_dir.name
         dst_scene_dir = dst_root / scene_name
         dst_scene_dir.mkdir(parents=True, exist_ok=True)
@@ -110,12 +130,23 @@ def preprocess_tmp_gaussian_output(
             copy_tree(exp_dir, target_dir)
 
 
-def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
+def build_pipeline_commands(
+    exp_name: str,
+    config_path: Path,
+    input_base_path: Path,
+) -> Sequence[Sequence[str]]:
     """Return the ordered list of commands composing the evaluation pipeline."""
 
     resolved_exp_name = exp_name or DEFAULT_EXP_NAME
     return (
-        ("python", "export_render_eval_data.py"),
+        (
+            "python",
+            "export_render_eval_data.py",
+            "--base-path",
+            str(input_base_path),
+            "--config-path",
+            str(config_path),
+        ),
         (
             "python",
             "gs_run_simulate.py",
@@ -129,6 +160,10 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(DEFAULT_DATA_ROOT),
             "--gaussian_root",
             str(OURS_GAUSSIAN_ROOT),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
@@ -136,9 +171,11 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             "--prediction_dir",
             str(DEFAULT_PREDICTION_DIR),
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--output_file",
             str(OURS_RESULTS_DIR / "final_results.csv"),
+            "--config-path",
+            str(config_path),
         ),
         (
             "python",
@@ -146,9 +183,11 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             "--prediction_path",
             str(DEFAULT_PREDICTION_DIR),
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--output_file",
             str(OURS_RESULTS_DIR / "final_track.csv"),
+            "--config-path",
+            str(config_path),
         ),
         (
             "python",
@@ -163,6 +202,10 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(OURS_OUTPUT_DIR),
             "--log_dir",
             str(OURS_RESULTS_DIR),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
@@ -177,18 +220,24 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(DEFAULT_DATA_ROOT),
             "--gaussian_root",
             str(OURS_GAUSSIAN_ROOT),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
             "visualize_render_results.py",
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--prediction_dir",
             str(OURS_WHITE_OUTPUT_DIR),
             "--human_mask_path",
             str(DEFAULT_HUMAN_MASK_PATH),
             "--object_mask_path",
             str(DEFAULT_RENDER_PATH),
+            "--config-path",
+            str(config_path),
         ),
         (
             "python",
@@ -203,6 +252,10 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(DEFAULT_DATA_ROOT),
             "--gaussian_root",
             str(ORIGINAL_GAUSSIAN_ROOT),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
@@ -210,9 +263,11 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             "--prediction_dir",
             str(DEFAULT_PREDICTION_DIR),
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--output_file",
             str(ORIGINAL_RESULTS_DIR / "final_results.csv"),
+            "--config-path",
+            str(config_path),
         ),
         (
             "python",
@@ -220,9 +275,11 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             "--prediction_path",
             str(DEFAULT_PREDICTION_DIR),
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--output_file",
             str(ORIGINAL_RESULTS_DIR / "final_track.csv"),
+            "--config-path",
+            str(config_path),
         ),
         (
             "python",
@@ -237,6 +294,10 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(ORIGINAL_OUTPUT_DIR),
             "--log_dir",
             str(ORIGINAL_RESULTS_DIR),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
@@ -251,18 +312,24 @@ def build_pipeline_commands(exp_name: str) -> Sequence[Sequence[str]]:
             str(DEFAULT_DATA_ROOT),
             "--gaussian_root",
             str(ORIGINAL_GAUSSIAN_ROOT),
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
         ),
         (
             "python",
             "visualize_render_results.py",
             "--base_path",
-            str(DEFAULT_BASE_PATH),
+            str(input_base_path),
             "--prediction_dir",
             str(ORIGINAL_WHITE_OUTPUT_DIR),
             "--human_mask_path",
             str(DEFAULT_HUMAN_MASK_PATH),
             "--object_mask_path",
             str(DEFAULT_RENDER_PATH),
+            "--config-path",
+            str(config_path),
         ),
     )
 
@@ -356,13 +423,33 @@ def main() -> None:
         default=os.environ.get("EVAL_EXP_NAME", DEFAULT_EXP_NAME),
         help="Experiment name whose checkpoints are evaluated.",
     )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Case allowlist CSV path.",
+    )
+    parser.add_argument(
+        "--input-base-path",
+        type=Path,
+        default=DEFAULT_BASE_PATH,
+        help="Input case root used with data_config.csv allowlist filtering.",
+    )
     args = parser.parse_args()
     exp_name = args.exp_name or DEFAULT_EXP_NAME
+    config_path = resolve_path_from_root(PROJECT_ROOT, args.config_path)
+    input_base_path = resolve_path_from_root(PROJECT_ROOT, args.input_base_path)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     OURS_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    preprocess_tmp_gaussian_output()
-    for command in build_pipeline_commands(exp_name):
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(input_base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "final_eval", input_base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
+    preprocess_tmp_gaussian_output(allowed_cases=allowed_cases)
+    for command in build_pipeline_commands(exp_name, config_path, input_base_path):
         run_command(command)
 
 

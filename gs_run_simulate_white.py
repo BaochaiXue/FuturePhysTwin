@@ -21,6 +21,16 @@ from pathlib import Path
 from typing import Iterable, Sequence
 from argparse import ArgumentParser, Namespace
 
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
+
+ROOT = Path(__file__).resolve().parent
+
 
 DEFAULT_OUTPUT_DIR = Path("gaussian_output_dynamic_white")
 DEFAULT_VIEWS: Sequence[str] = ("0", "1", "2")
@@ -101,20 +111,50 @@ def parse_args() -> Namespace:
         default=DEFAULT_GAUSSIAN_ROOT,
         help=f"Root directory of Gaussian checkpoints (default: {DEFAULT_GAUSSIAN_ROOT}).",
     )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=Path("./data_config.csv"),
+        help="Case allowlist CSV path.",
+    )
+    parser.add_argument(
+        "--input-base-path",
+        type=Path,
+        default=Path("./data/different_types"),
+        help="Input case root used with data_config.csv allowlist filtering.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    output_dir = args.output_dir
+    output_dir = resolve_path_from_root(ROOT, args.output_dir)
     views = tuple(args.views)
     exp_name = args.exp_name
-    data_root = args.data_root
-    gaussian_root = args.gaussian_root
+    data_root = resolve_path_from_root(ROOT, args.data_root)
+    gaussian_root = resolve_path_from_root(ROOT, args.gaussian_root)
+    config_path = resolve_path_from_root(ROOT, args.config_path)
+    input_base_path = resolve_path_from_root(ROOT, args.input_base_path)
+
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(input_base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "gs_run_simulate_white", input_base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    for scene_dir in iter_scene_dirs(data_root):
+    scene_dirs = list(iter_scene_dirs(data_root))
+    scene_dirs_by_name = {scene_dir.name: scene_dir for scene_dir in scene_dirs}
+    filtered_scene_names = filter_candidates(
+        [scene_dir.name for scene_dir in scene_dirs],
+        allowed_cases,
+        "gs_run_simulate_white",
+        str(data_root),
+    )
+    for scene_name in filtered_scene_names:
+        scene_dir = scene_dirs_by_name[scene_name]
         scene_name = scene_dir.name
         model_dir = gaussian_root / scene_name / exp_name
         if not model_dir.exists():

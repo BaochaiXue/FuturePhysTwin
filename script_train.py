@@ -21,8 +21,17 @@ import sys
 import time
 from pathlib import Path
 
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
+
 
 DEFAULT_BASE_PATH = "./data/different_types"
+DEFAULT_CONFIG_PATH = "./data_config.csv"
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BASE_DELAY = 3.0
 ROOT = Path(__file__).resolve().parent
@@ -44,6 +53,11 @@ def parse_args() -> argparse.Namespace:
         "--python",
         default=sys.executable,
         help="Python executable used to launch train_warp.py.",
+    )
+    parser.add_argument(
+        "--config-path",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Case allowlist CSV path (default: {DEFAULT_CONFIG_PATH}).",
     )
     parser.add_argument(
         "--max-retries",
@@ -212,15 +226,32 @@ def _run_case_with_retries(
 def main() -> int:
     args = parse_args()
 
-    base_path = Path(args.base_path)
-    if not base_path.is_absolute():
-        base_path = (ROOT / base_path).resolve()
+    base_path = resolve_path_from_root(ROOT, args.base_path)
     if not base_path.exists() or not base_path.is_dir():
         raise FileNotFoundError(f"Base path is not a directory: {base_path}")
+    config_path = resolve_path_from_root(ROOT, args.config_path)
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "script_train", base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
 
     case_dirs = sorted([path for path in base_path.glob("*") if path.is_dir()])
     if not case_dirs:
         raise RuntimeError(f"No case directories found under: {base_path}")
+    case_dirs_by_name = {case_dir.name: case_dir for case_dir in case_dirs}
+    filtered_case_names = filter_candidates(
+        [case_dir.name for case_dir in case_dirs],
+        allowed_cases,
+        "script_train",
+        str(base_path),
+    )
+    case_dirs = [case_dirs_by_name[name] for name in filtered_case_names]
+    if not case_dirs:
+        print("[Train] No allowed cases found after data_config.csv filtering.")
+        print("[Train] Summary: success=0, failed=0")
+        return 0
 
     success_count = 0
     failed_cases: list[str] = []

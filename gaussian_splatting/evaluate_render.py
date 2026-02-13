@@ -1,5 +1,7 @@
 import os
 from argparse import ArgumentParser, Namespace
+from pathlib import Path
+import sys
 from PIL import Image
 from utils.loss_utils import ssim
 from lpipsPyTorch import lpips
@@ -11,6 +13,18 @@ import torch
 # import torchvision.transforms.functional as tf
 import torchvision.transforms as transforms
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from case_filter import (  # noqa: E402
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    resolve_path_from_root,
+    warn_input_cases_missing_in_config,
+)
 
 
 def img2tensor(img):
@@ -57,22 +71,51 @@ def parse_args() -> Namespace:
         default="./results",
         help="Directory to store evaluation logs (default: ./results).",
     )
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        default="./data_config.csv",
+        help="Case allowlist CSV path (default: ./data_config.csv).",
+    )
+    parser.add_argument(
+        "--input-base-path",
+        type=str,
+        default="./data/different_types",
+        help="Input case root used with data_config.csv allowlist filtering.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    render_path = args.render_path
-    human_mask_path = args.human_mask_path
-    root_data_dir = args.root_data_dir
-    output_dir = args.output_dir
-    log_dir = args.log_dir
+    render_path = str(resolve_path_from_root(REPO_ROOT, args.render_path))
+    human_mask_path = str(resolve_path_from_root(REPO_ROOT, args.human_mask_path))
+    root_data_dir = str(resolve_path_from_root(REPO_ROOT, args.root_data_dir))
+    output_dir = str(resolve_path_from_root(REPO_ROOT, args.output_dir))
+    log_dir = str(resolve_path_from_root(REPO_ROOT, args.log_dir))
+    config_path = resolve_path_from_root(REPO_ROOT, args.config_path)
+    input_base_path = resolve_path_from_root(REPO_ROOT, args.input_base_path)
     os.makedirs(log_dir, exist_ok=True)
     log_file_path = os.path.join(log_dir, "output_dynamic.txt")
 
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(input_base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "evaluate_render", input_base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
+
     with open(log_file_path, "w") as log_file:
 
-        scene_name = sorted(os.listdir(render_path))
+        scene_dirs = sorted(
+            p for p in Path(render_path).iterdir() if p.is_dir()
+        )
+        scene_name = filter_candidates(
+            [scene_dir.name for scene_dir in scene_dirs],
+            allowed_cases,
+            "evaluate_render",
+            render_path,
+        )
 
         all_psnrs_train, all_ssims_train, all_lpipss_train, all_ious_train = (
             [],

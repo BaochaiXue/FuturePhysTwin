@@ -21,7 +21,7 @@ from pathlib import Path
 #   script_inference -> python script_inference.py
 #   dynamic_fast_gs -> python dynamic_fast_gs.py
 #   final_eval -> python final_eval.py
-START_STAGE: str | None = "script_optimize"
+START_STAGE: str | None = None
 ARCHIVE_RESULT_DIR_NAME = "archive_result"
 DEFAULT_TASK_NAME = "exp_new_data_and_old_data"
 ARCHIVE_OUTPUT_DIRS = (
@@ -29,6 +29,11 @@ ARCHIVE_OUTPUT_DIRS = (
     "gaussian_output_video",
     "gaussian_output_dynamic",
     "gaussian_output_dynamic_white",
+)
+MP4_PREFIX_DIRS = (
+    "gaussian_output_dynamic_white",
+    "gaussian_output_dynamic",
+    "gaussian_output_video",
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -178,6 +183,52 @@ def archive_outputs(archive_task_dir: Path) -> None:
         shutil.move(str(source), str(archive_task_dir / directory_name))
 
 
+def rename_mp4_files_with_task_case_prefix(
+    task_archive_dir: Path, task_name: str, subdir_name: str
+) -> tuple[int, int]:
+    """Rename mp4 files under a subdir to include task/case prefix.
+
+    Pattern:
+    - old:  <case>/<original>.mp4
+    - new:  <case>/<task_name>_<case>_<original>.mp4
+    """
+
+    mp4_root_dir = task_archive_dir / subdir_name
+    if not mp4_root_dir.exists():
+        return 0, 0
+
+    renamed_count = 0
+    skipped_count = 0
+    mp4_paths = sorted(path for path in mp4_root_dir.rglob("*.mp4") if path.is_file())
+    for mp4_path in mp4_paths:
+        case_name = mp4_path.parent.name
+        prefix = f"{task_name}_{case_name}_"
+        if mp4_path.name.startswith(prefix):
+            skipped_count += 1
+            continue
+
+        target_path = mp4_path.with_name(f"{prefix}{mp4_path.name}")
+        if target_path.exists():
+            raise FileExistsError(
+                f"Cannot rename {mp4_path} because target already exists: {target_path}"
+            )
+        mp4_path.rename(target_path)
+        renamed_count += 1
+
+    return renamed_count, skipped_count
+
+
+def rename_archive_mp4_files(
+    task_archive_dir: Path, task_name: str
+) -> dict[str, tuple[int, int]]:
+    stats: dict[str, tuple[int, int]] = {}
+    for subdir_name in MP4_PREFIX_DIRS:
+        stats[subdir_name] = rename_mp4_files_with_task_case_prefix(
+            task_archive_dir, task_name, subdir_name
+        )
+    return stats
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run full pipeline with tee-style logs."
@@ -245,6 +296,7 @@ def main() -> int:
         for step_name, script_file in STEPS[start_index:]:
             run_step(step_name, ROOT / script_file, logs_dir, args.python)
         archive_outputs(archive_task_dir)
+        rename_stats = rename_archive_mp4_files(archive_task_dir, task_name)
     except KeyboardInterrupt:
         print("\n[Pipeline] Interrupted by user.", file=sys.stderr)
         return 130
@@ -253,6 +305,15 @@ def main() -> int:
         return 1
 
     print(f"[Pipeline] Archived outputs to: {archive_task_dir}")
+    for subdir_name in MP4_PREFIX_DIRS:
+        renamed_count, skipped_count = rename_stats.get(subdir_name, (0, 0))
+        print(
+            "[Pipeline] Renamed mp4 in {subdir}: renamed={renamed}, skipped={skipped}".format(
+                subdir=subdir_name,
+                renamed=renamed_count,
+                skipped=skipped_count,
+            )
+        )
     print("\n[Pipeline] All steps completed successfully.")
     return 0
 

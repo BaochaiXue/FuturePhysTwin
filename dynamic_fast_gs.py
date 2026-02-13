@@ -27,6 +27,13 @@ import shutil
 from typing import Iterable, Sequence
 import time
 
+from case_filter import (
+    filter_candidates,
+    load_config_cases,
+    load_input_cases,
+    warn_input_cases_missing_in_config,
+)
+
 DEFAULT_COLOR_TRAIN_FRAMES = None
 DEFAULT_COLOR_TRAIN_CAMS = None
 
@@ -213,6 +220,18 @@ def main() -> None:
             "(generate both rollout and absolute caches)."
         ),
     )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=Path("./data_config.csv"),
+        help="Case allowlist CSV path.",
+    )
+    parser.add_argument(
+        "--input-base-path",
+        type=Path,
+        default=Path("./data/different_types"),
+        help="Input case root used with data_config.csv allowlist filtering.",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -221,10 +240,18 @@ def main() -> None:
     data_dir: Path = resolve_path(root, args.data_dir)
     output_dir: Path = resolve_path(root, args.output_dir)
     video_dir: Path = resolve_path(root, args.video_dir)
+    config_path: Path = resolve_path(root, args.config_path)
+    input_base_path: Path = resolve_path(root, args.input_base_path)
 
     # Guard against typos or missing exports by validating the input directory up front.
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {data_dir}")
+    config_cases = load_config_cases(config_path)
+    input_cases = load_input_cases(input_base_path)
+    warn_input_cases_missing_in_config(
+        input_cases, config_cases, "dynamic_fast_gs", input_base_path, config_path
+    )
+    allowed_cases = input_cases & config_cases
 
     # Ensure output/video directories exist before we launch long-running training jobs.
     ensure_dir(output_dir)
@@ -237,19 +264,36 @@ def main() -> None:
     if not frame_directories:
         raise FileNotFoundError(f"No frame subdirectories found under {data_dir}")
     frame_count: dict[str, int] = {}
+    discovered_scene_names: set[str] = set()
     for frame_dir in frame_directories:
         print(f"[InterpPoses] Generating poses for frame directory: {frame_dir}")
-        for scene_dir in iter_scene_directories(frame_dir):
-            scene_name = scene_dir.name
+        frame_scene_names = [scene_dir.name for scene_dir in iter_scene_directories(frame_dir)]
+        discovered_scene_names.update(frame_scene_names)
+        allowed_frame_scene_names = [
+            scene_name for scene_name in frame_scene_names if scene_name in allowed_cases
+        ]
+        for scene_name in allowed_frame_scene_names:
             frame_count[scene_name] = frame_count.get(scene_name, 0) + 1
+
+        if not allowed_frame_scene_names:
+            continue
+
         run_command(
             [
                 "python",
                 str(root / "gaussian_splatting" / "generate_interp_poses.py"),
                 "--root_dir",
                 str(frame_dir),
+                "--scenes",
+                *allowed_frame_scene_names,
             ]
         )
+    filter_candidates(
+        sorted(discovered_scene_names),
+        allowed_cases,
+        "dynamic_fast_gs",
+        f"{data_dir} (all frames)",
+    )
 
     canonical_frame_dir: Path = frame_directories[0]
     frame_name: str = canonical_frame_dir.name
@@ -258,7 +302,19 @@ def main() -> None:
     # Iterate over each case/scene for the canonical frame.
     # ------------------------------------------------------------------
     final_models: list[tuple[Path, str, Path]] = []
-    for scene_dir in iter_scene_directories(canonical_frame_dir):
+    canonical_scene_dirs = list(iter_scene_directories(canonical_frame_dir))
+    scene_dirs_by_name = {scene_dir.name: scene_dir for scene_dir in canonical_scene_dirs}
+    filtered_scene_names = filter_candidates(
+        [scene_dir.name for scene_dir in canonical_scene_dirs],
+        allowed_cases,
+        "dynamic_fast_gs",
+        str(canonical_frame_dir),
+    )
+    if not filtered_scene_names:
+        print("[dynamic_fast_gs] No allowed cases found after data_config.csv filtering.")
+        return
+    for scene_name in filtered_scene_names:
+        scene_dir = scene_dirs_by_name[scene_name]
         scene_name: str = scene_dir.name  # e.g. "cloth_scene_01"
         print(f"[Frame {frame_name}] Processing scene: {scene_name}")
 

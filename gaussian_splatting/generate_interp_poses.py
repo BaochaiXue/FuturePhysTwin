@@ -86,12 +86,34 @@ def main() -> None:
         default=Path("./data/gaussian_data"),
         help="Root directory containing per-scene folders (default: ./data/gaussian_data).",
     )
+    parser.add_argument(
+        "--scenes",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional list of scene names under root_dir to process. "
+            "When omitted, all scene subdirectories are processed."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.root_dir.is_dir():
         raise FileNotFoundError(f"Scene root directory not found: {args.root_dir}")
 
-    for scene_dir in sorted(p for p in args.root_dir.iterdir() if p.is_dir()):
+    if args.scenes:
+        scene_dirs = []
+        for scene_name in args.scenes:
+            scene_dir = args.root_dir / scene_name
+            if not scene_dir.is_dir():
+                print(
+                    f"[Warning] Scene '{scene_name}' not found under {args.root_dir}; skipping."
+                )
+                continue
+            scene_dirs.append(scene_dir)
+    else:
+        scene_dirs = sorted(p for p in args.root_dir.iterdir() if p.is_dir())
+
+    for scene_dir in scene_dirs:
         print(f"Processing {scene_dir.name}")
         camera_path = scene_dir / "camera_meta.pkl"
         with camera_path.open("rb") as f:
