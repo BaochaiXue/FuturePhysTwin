@@ -23,7 +23,7 @@ from pathlib import Path
 #   final_eval -> python final_eval.py
 START_STAGE: str | None = None
 ARCHIVE_RESULT_DIR_NAME = "archive_result"
-DEFAULT_TASK_NAME = "exp_new_data_and_old_data"
+DEFAULT_TASK_NAME = "sloth_zebra_around_single_frame"
 ARCHIVE_OUTPUT_DIRS = (
     "results",
     "gaussian_output_video",

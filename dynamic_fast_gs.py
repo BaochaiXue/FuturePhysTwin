@@ -6,7 +6,7 @@ Inputs
 ------
 - Frame-level Gaussian data at ``./per_frame_gaussian_data/<frame>/<scene>/`` (override via ``--data_dir``) containing RGB, depth, masks, ``camera_meta.pkl``, ``observation.ply``, and optional ``shape_prior.glb``.
 - Helper scripts: ``generate_interp_poses.py``, ``dynamic_fast_canonical.py``, ``gs_render.py``, ``img2video.py``.
-- Optional motion references (``experiments/<scene>/inference.pkl``, ``data/different_types/<scene>/track_process_data.pkl``). When present they are copied next to the canonical checkpoint and ``precompute_lbs_pose_cache.py`` is invoked to produce ``lbs_pose_cache.pt``. Stage B (`dynamic_fast_color.py`) then scans ``per_frame_gaussian_data/*/<scene>/`` via ``--frames_dir`` to aggregate all frame-specific cameras.
+- Optional motion references (``experiments/<scene>/inference.pkl``, ``data/different_types/<scene>/track_process_data.pkl``). When present they are copied next to the canonical checkpoint and ``precompute_lbs_pose_cache.py`` is invoked to produce ``lbs_pose_cache.pt``. Stage B (`dynamic_fast_color.py`) only scans ``per_frame_gaussian_data/*/<scene>/`` via ``--frames_dir`` when ``--enable_multi_frame_color_training`` is set.
 
 Outputs
 -------
@@ -36,6 +36,7 @@ from case_filter import (
 
 DEFAULT_COLOR_TRAIN_FRAMES = None
 DEFAULT_COLOR_TRAIN_CAMS = None
+DEFAULT_ENABLE_MULTI_FRAME_COLOR_TRAINING = False
 
 
 def run_command(
@@ -171,6 +172,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_COLOR_TRAIN_CAMS,
         help="Camera indices forwarded to dynamic_fast_color via --train_cams.",
+    )
+    parser.add_argument(
+        "--enable_multi_frame_color_training",
+        action="store_true",
+        default=DEFAULT_ENABLE_MULTI_FRAME_COLOR_TRAINING,
+        help=(
+            "Enable multi-frame color refinement by forwarding --frames_dir to "
+            "dynamic_fast_color. Disabled by default to keep single-frame training."
+        ),
     )
     parser.add_argument(
         "--train_all_parameter",
@@ -463,10 +473,16 @@ def main() -> None:
                 f"[LBS] Warning: offline pose cache missing at {pose_cache_path}; "
                 "colour stage will run without pose deformation."
             )
-        color_command.extend(["--frames_dir", str(data_dir)])
-        if args.color_train_frames:
-            frame_spec = ",".join(str(frame) for frame in args.color_train_frames)
-            color_command.extend(["--train_frames", frame_spec])
+        if args.enable_multi_frame_color_training:
+            color_command.extend(["--frames_dir", str(data_dir)])
+            if args.color_train_frames:
+                frame_spec = ",".join(str(frame) for frame in args.color_train_frames)
+                color_command.extend(["--train_frames", frame_spec])
+        elif args.color_train_frames:
+            print(
+                "[Color] Ignoring --color_train_frames because multi-frame color "
+                "training is disabled. Use --enable_multi_frame_color_training to enable it."
+            )
         if args.color_train_cams:
             color_command.append("--train_cams")
             color_command.extend(str(cam) for cam in args.color_train_cams)

@@ -5,10 +5,12 @@ import numpy as np
 import open3d as o3d
 import json
 import pickle
-import cv2
+import imageio
+import imageio.v3 as iio
 from tqdm import tqdm
 import os
 from argparse import ArgumentParser
+from PIL import Image, ImageDraw
 
 parser = ArgumentParser()
 parser.add_argument(
@@ -17,10 +19,49 @@ parser.add_argument(
     required=True,
 )
 parser.add_argument("--case_name", type=str, required=True)
+parser.add_argument(
+    "--debug-width",
+    type=int,
+    default=1280,
+    help="Debug rendering width per viewpoint.",
+)
+parser.add_argument(
+    "--debug-height",
+    type=int,
+    default=720,
+    help="Debug rendering height per viewpoint.",
+)
+parser.add_argument(
+    "--debug-panel-mode",
+    type=str,
+    choices=["camera", "view"],
+    default="camera",
+    help="camera: cam0/cam1/cam2 raw panels, view: merged cloud with front/side/top.",
+)
+parser.add_argument(
+    "--debug-camera-zoom",
+    type=float,
+    default=0.11,
+    help="Camera panel zoom. Smaller value means closer view.",
+)
+parser.add_argument(
+    "--debug-focus-quantile",
+    type=float,
+    default=0.90,
+    help=(
+        "Only for visualization: keep nearest quantile around median center "
+        "to suppress far outlier rays."
+    ),
+)
 args = parser.parse_args()
 
 base_path = args.base_path
 case_name = args.case_name
+debug_width = args.debug_width
+debug_height = args.debug_height
+debug_panel_mode = args.debug_panel_mode
+debug_camera_zoom = args.debug_camera_zoom
+debug_focus_quantile = args.debug_focus_quantile
 
 
 # Use code from https://github.com/Jianghanxiao/Helper3D/blob/master/open3d_RGBD/src/camera/cameraHelper.py
@@ -99,8 +140,11 @@ def get_pcd_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
     total_colors = []
     total_masks = []
     for i in range(num_cam):
-        color = cv2.imread(f"{path}/color/{i}/{frame_idx}.png")
-        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        color = iio.imread(f"{path}/color/{i}/{frame_idx}.png")
+        if color.ndim == 2:
+            color = np.repeat(color[..., None], 3, axis=2)
+        if color.shape[-1] == 4:
+            color = color[:, :, :3]
         color = color.astype(np.float32) / 255.0
         depth = np.load(f"{path}/depth/{i}/{frame_idx}.npy") / 1000.0
 
@@ -108,7 +152,7 @@ def get_pcd_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
             depth,
             intrinsic=intrinsics[i],
         )
-        masks = np.logical_and(points[:, :, 2] > 0.2, points[:, :, 2] < 1.5)
+        masks = np.logical_and(points[:, :, 2] > 0.2, points[:, :, 2] < 5.5)
         points_flat = points.reshape(-1, 3)
         # Transform points to world coordinates using homogeneous transformation
         homogeneous_points = np.hstack(
@@ -139,7 +183,7 @@ def get_pcd_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
     # mask = np.logical_and(mask, visualize_points[:, 2] < 0.2)
     # visualize_points = visualize_points[mask]
     # visualize_colors = visualize_colors[mask]
-        
+
     # pcd.points = o3d.utility.Vector3dVector(np.concatenate(visualize_points).reshape(-1, 3))
     # pcd.colors = o3d.utility.Vector3dVector(np.concatenate(visualize_colors).reshape(-1, 3))
     # o3d.visualization.draw_geometries([pcd])
@@ -154,11 +198,78 @@ def exist_dir(dir):
         os.makedirs(dir)
 
 
+def get_raw_points_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
+    raw_points_per_cam = []
+    raw_colors_per_cam = []
+    for i in range(num_cam):
+        color = iio.imread(f"{path}/color/{i}/{frame_idx}.png")
+        if color.ndim == 2:
+            color = np.repeat(color[..., None], 3, axis=2)
+        if color.shape[-1] == 4:
+            color = color[:, :, :3]
+        color = color.astype(np.float32) / 255.0
+        depth = np.load(f"{path}/depth/{i}/{frame_idx}.npy") / 1000.0
+
+        points = getPcdFromDepth(depth, intrinsic=intrinsics[i])
+        valid_raw_mask = np.logical_and(np.isfinite(depth), depth > 0.0)
+        points_flat = points.reshape(-1, 3)
+        homogeneous_points = np.hstack(
+            (points_flat, np.ones((points_flat.shape[0], 1)))
+        )
+        points_world = np.dot(c2ws[i], homogeneous_points.T).T[:, :3]
+        points_world = points_world.reshape(points.shape)
+
+        raw_points = points_world[valid_raw_mask].reshape(-1, 3)
+        raw_colors = color[valid_raw_mask].reshape(-1, 3)
+        raw_points_per_cam.append(raw_points)
+        raw_colors_per_cam.append(raw_colors)
+
+    raw_points_merged = np.concatenate(raw_points_per_cam, axis=0)
+    raw_colors_merged = np.concatenate(raw_colors_per_cam, axis=0)
+    return raw_points_per_cam, raw_colors_per_cam, raw_points_merged, raw_colors_merged
+
+
+def set_view(view_control, lookat, front, up, zoom):
+    view_control.set_lookat(lookat.tolist())
+    view_control.set_front(front)
+    view_control.set_up(up)
+    view_control.set_zoom(zoom)
+
+
+def get_focus_points(points, colors, focus_quantile):
+    if points.shape[0] == 0:
+        return points, colors, np.zeros((3,), dtype=np.float32)
+    center = np.median(points, axis=0)
+    q = float(np.clip(focus_quantile, 0.05, 1.0))
+    if q >= 1.0:
+        return points, colors, center
+
+    dist = np.linalg.norm(points - center[None, :], axis=1)
+    radius = np.quantile(dist, q)
+    keep = dist <= radius
+    if keep.sum() < 2000:
+        # Avoid over-clipping on sparse frames.
+        keep = dist <= np.quantile(dist, 0.95)
+    focus_points = points[keep]
+    focus_colors = colors[keep]
+    focus_center = np.median(focus_points, axis=0)
+    return focus_points, focus_colors, focus_center
+
+
+def draw_view_labels(frame_concat, frame_idx, panel_labels):
+    image = Image.fromarray(frame_concat)
+    draw = ImageDraw.Draw(image)
+    draw.text((12, 10), f"frame={frame_idx}", fill=(255, 255, 255))
+    panel_width = frame_concat.shape[1] // len(panel_labels)
+    for panel_idx, label in enumerate(panel_labels):
+        draw.text((panel_width * panel_idx + 12, 34), label, fill=(255, 255, 255))
+    return np.asarray(image)
+
+
 if __name__ == "__main__":
     with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
         data = json.load(f)
     intrinsics = np.array(data["intrinsics"])
-    WH = data["WH"]
     frame_num = data["frame_num"]
     print(data["serial_numbers"])
 
@@ -166,60 +277,124 @@ if __name__ == "__main__":
     c2ws = pickle.load(open(f"{base_path}/{case_name}/calibrate.pkl", "rb"))
 
     exist_dir(f"{base_path}/{case_name}/pcd")
-
-    cameras = []
-    # Visualize the cameras
-    for i in range(num_cam):
-        camera = getCamera(
-            c2ws[i],
-            intrinsics[i, 0, 0],
-            intrinsics[i, 1, 1],
-            intrinsics[i, 0, 2],
-            intrinsics[i, 1, 2],
-            z_flip=True,
-            scale=0.2,
-        )
-        cameras += camera
+    debug_dir = f"{base_path}/{case_name}/pcd_debug"
+    exist_dir(debug_dir)
 
     vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    for camera in cameras:
-        vis.add_geometry(camera)
+    vis.create_window(
+        window_name="raw_pcd_debug",
+        width=debug_width,
+        height=debug_height,
+        visible=False,
+    )
+    render_option = vis.get_render_option()
+    render_option.background_color = np.array([0.05, 0.05, 0.05])
+    render_option.point_size = 4.0
 
-    coordinate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-    vis.add_geometry(coordinate)
+    video_path = f"{debug_dir}/pcd.mp4"
+    video_writer = imageio.get_writer(video_path, fps=30, macro_block_size=1)
+    if debug_panel_mode == "view":
+        panel_labels = ["front", "side", "top"]
+        view_presets = (
+            ([1.0, 0.0, -2.0], [0.0, 0.0, -1.0], 0.20),  # front-oblique
+            ([0.0, 1.0, -2.0], [0.0, 0.0, -1.0], 0.20),  # side-oblique
+            ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0], 0.20),  # top-down
+        )
+    else:
+        panel_labels = ["cam0 raw", "cam1 raw", "cam2 raw"]
+        view_presets = None
 
     pcd = None
     for i in tqdm(range(frame_num)):
         points, colors, masks = get_pcd_from_data(
             f"{base_path}/{case_name}", i, num_cam, intrinsics, c2ws
         )
+        (
+            raw_points_per_cam,
+            raw_colors_per_cam,
+            raw_points_merged,
+            raw_colors_merged,
+        ) = get_raw_points_from_data(
+            f"{base_path}/{case_name}", i, num_cam, intrinsics, c2ws
+        )
 
         if i == 0:
             pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(
-                points.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            pcd.colors = o3d.utility.Vector3dVector(
-                colors.reshape(-1, 3)[masks.reshape(-1)]
-            )
+            pcd.points = o3d.utility.Vector3dVector(raw_points_merged)
+            pcd.colors = o3d.utility.Vector3dVector(raw_colors_merged)
             vis.add_geometry(pcd)
-            # Adjust the viewpoint
-            view_control = vis.get_view_control()
-            view_control.set_front([1, 0, -2])
-            view_control.set_up([0, 0, -1])
-            view_control.set_zoom(1)
+            vis.reset_view_point(True)
+
+            # Dump first-frame raw point clouds for direct inspection.
+            merged_pcd = o3d.geometry.PointCloud()
+            merged_pcd.points = o3d.utility.Vector3dVector(raw_points_merged)
+            merged_pcd.colors = o3d.utility.Vector3dVector(raw_colors_merged)
+            o3d.io.write_point_cloud(
+                f"{debug_dir}/frame0_merged_raw.ply", merged_pcd, write_ascii=False
+            )
+            for cam_idx in range(num_cam):
+                cam_pcd = o3d.geometry.PointCloud()
+                cam_pcd.points = o3d.utility.Vector3dVector(raw_points_per_cam[cam_idx])
+                cam_pcd.colors = o3d.utility.Vector3dVector(raw_colors_per_cam[cam_idx])
+                o3d.io.write_point_cloud(
+                    f"{debug_dir}/frame0_cam{cam_idx}_raw.ply",
+                    cam_pcd,
+                    write_ascii=False,
+                )
         else:
-            pcd.points = o3d.utility.Vector3dVector(
-                points.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            pcd.colors = o3d.utility.Vector3dVector(
-                colors.reshape(-1, 3)[masks.reshape(-1)]
-            )
+            pcd.points = o3d.utility.Vector3dVector(raw_points_merged)
+            pcd.colors = o3d.utility.Vector3dVector(raw_colors_merged)
             vis.update_geometry(pcd)
 
-            vis.poll_events()
-            vis.update_renderer()
+        view_control = vis.get_view_control()
+        frames = []
+        if debug_panel_mode == "view":
+            for front, up, zoom in view_presets:
+                render_points, render_colors, render_center = get_focus_points(
+                    raw_points_merged, raw_colors_merged, debug_focus_quantile
+                )
+                pcd.points = o3d.utility.Vector3dVector(render_points)
+                pcd.colors = o3d.utility.Vector3dVector(render_colors)
+                vis.update_geometry(pcd)
+                # Recompute camera bounds from current geometry so zoom works on focused points.
+                vis.reset_view_point(True)
+                set_view(view_control, render_center, front, up, zoom)
+                view_control.unset_constant_z_near()
+                view_control.unset_constant_z_far()
+                vis.poll_events()
+                vis.update_renderer()
+                frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                frames.append((frame * 255).astype(np.uint8))
+        else:
+            for cam_idx in range(num_cam):
+                cam_points = raw_points_per_cam[cam_idx]
+                cam_colors = raw_colors_per_cam[cam_idx]
+                render_points, render_colors, cam_lookat = get_focus_points(
+                    cam_points, cam_colors, debug_focus_quantile
+                )
+                pcd.points = o3d.utility.Vector3dVector(render_points)
+                pcd.colors = o3d.utility.Vector3dVector(render_colors)
+                vis.update_geometry(pcd)
+                # Recompute camera bounds from current geometry so zoom works on focused points.
+                vis.reset_view_point(True)
+                set_view(
+                    view_control,
+                    cam_lookat,
+                    [1.0, 0.0, -2.0],
+                    [0.0, 0.0, -1.0],
+                    debug_camera_zoom,
+                )
+                view_control.unset_constant_z_near()
+                view_control.unset_constant_z_far()
+                vis.poll_events()
+                vis.update_renderer()
+                frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                frames.append((frame * 255).astype(np.uint8))
+        frame_concat = np.concatenate(frames, axis=1)
+        frame_concat = draw_view_labels(frame_concat, i, panel_labels)
+        if i == 0:
+            iio.imwrite(f"{debug_dir}/frame0_raw_3view.png", frame_concat)
+        video_writer.append_data(frame_concat)
 
         np.savez(
             f"{base_path}/{case_name}/pcd/{i}.npz",
@@ -227,3 +402,7 @@ if __name__ == "__main__":
             colors=colors,
             masks=masks,
         )
+
+    video_writer.close()
+    vis.destroy_window()
+    print(f"Saved pcd debug video to: {video_path}")

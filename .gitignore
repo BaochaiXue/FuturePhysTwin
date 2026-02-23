@@ -10,6 +10,9 @@ data_collect*
 *.pkl
 *.log
 *.txt
+DepthCamera_*.json
+tmp_depth_cam_diagnostics/
+data_config_old.csv
 past*
 deprecated/
 *.npz

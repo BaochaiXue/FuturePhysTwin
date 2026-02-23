@@ -66,8 +66,21 @@ if __name__ == "__main__":
             [np.zeros((query_pixels.shape[0], 1)), query_pixels], axis=1
         )
         query_pixels = torch.tensor(query_pixels, dtype=torch.float32).to(device)
-        # Randomly select 5000 query points
-        query_pixels = query_pixels[torch.randperm(query_pixels.shape[0])[:5000]]
+        # Randomly subsample query points in strict mode (<5000 is invalid)
+        num_query_pixels = query_pixels.shape[0]
+        if num_query_pixels >= 10000:
+            target_num_queries = 10000
+        elif num_query_pixels >= 5000:
+            target_num_queries = 5000
+        else:
+            raise ValueError(f"Too few query pixels: {num_query_pixels}")
+
+        if num_query_pixels > target_num_queries:
+            query_pixels = query_pixels[
+                torch.randperm(num_query_pixels, device=query_pixels.device)[
+                    :target_num_queries
+                ]
+            ]
 
         # cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
         # pred_tracks, pred_visibility = cotracker(video, queries=query_pixels[None], backward_tracking=True)
