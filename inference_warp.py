@@ -72,6 +72,8 @@ if __name__ == "__main__":
         pure_inference_mode=True,
     )
     expected_springs = trainer.simulator.n_springs
+    expected_edges = trainer.init_springs.detach().cpu()
+    expected_rest = trainer.init_rest_lengths.detach().cpu()
 
     def _extract_epoch(path: str):
         basename = os.path.basename(path)
@@ -100,6 +102,34 @@ if __name__ == "__main__":
 
         spring_len = len(checkpoint.get("spring_Y", []))
         if spring_len == expected_springs:
+            if "spring_edges" in checkpoint and "spring_rest_lengths" in checkpoint:
+                ck_edges = checkpoint["spring_edges"].detach().cpu()
+                ck_rest = checkpoint["spring_rest_lengths"].detach().cpu()
+
+                edges_ok = (
+                    ck_edges.shape == expected_edges.shape
+                    and torch.equal(ck_edges.to(dtype=expected_edges.dtype), expected_edges)
+                )
+                rest_ok = (
+                    ck_rest.shape == expected_rest.shape
+                    and torch.allclose(
+                        ck_rest.to(dtype=torch.float32),
+                        expected_rest.to(dtype=torch.float32),
+                        atol=1e-8,
+                        rtol=0.0,
+                    )
+                )
+                if not (edges_ok and rest_ok):
+                    logger.warning(
+                        f"Skip {path}: topology mismatch with current case initialization"
+                    )
+                    continue
+            else:
+                logger.warning(
+                    f"Checkpoint {path} missing topology fields; "
+                    "falling back to spring-count compatibility only"
+                )
+
             mtime = os.path.getmtime(path)
             matching_models.append((epoch, mtime, path))
         else:
