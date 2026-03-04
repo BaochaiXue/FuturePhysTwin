@@ -437,18 +437,13 @@ class InvPhyTrainerWarp:
                     },
                     step=i,
                 )
-                # Save the parameters and topology
+                # Save learned parameters; topology is exported via standalone tool.
                 cur_model = {
                     "epoch": i,
                     "num_object_springs": self.num_object_springs,
                     "spring_Y": torch.exp(
                         wp.to_torch(self.simulator.wp_spring_Y, requires_grad=False)
                     ),
-                    # ── Topology (exact edges/rest from training) ──
-                    "spring_edges": self.init_springs.cpu(),
-                    "spring_rest_lengths": self.init_rest_lengths.cpu(),
-                    "init_vertices": self.init_vertices.cpu(),
-                    "init_masses": self.init_masses.cpu(),
                     # ── Learned physics parameters ──
                     "collide_elas": wp.to_torch(
                         self.simulator.wp_collide_elas, requires_grad=False

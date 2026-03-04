@@ -10,6 +10,9 @@ import os
 import pickle
 import json
 import re
+from pathlib import Path
+
+from export_topology import dump_topology_from_trainer
 
 
 def set_all_seeds(seed):
@@ -71,6 +74,14 @@ if __name__ == "__main__":
         base_dir=base_dir,
         pure_inference_mode=True,
     )
+    topology_path = (Path(base_dir) / "topology.npz").resolve()
+    dump_topology_from_trainer(
+        trainer=trainer,
+        case_name=case_name,
+        out_path=topology_path,
+        overwrite=True,
+    )
+    logger.info(f"Topology sidecar refreshed: {topology_path}")
     expected_springs = trainer.simulator.n_springs
     expected_edges = trainer.init_springs.detach().cpu()
     expected_rest = trainer.init_rest_lengths.detach().cpu()
