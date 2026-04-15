@@ -38,6 +38,8 @@ MP4_PREFIX_DIRS = (
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LOG_DIR = ROOT / "logs"
+DEFAULT_CONFIG_PATH = ROOT / "data_config.csv"
+DEFAULT_INPUT_BASE_PATH = ROOT / "data" / "different_types"
 STEPS = [
     ("script_process_data", "script_process_data.py"),
     ("export_video_human_mask", "export_video_human_mask.py"),
@@ -116,13 +118,46 @@ def tee_stream(
     return t
 
 
+def build_step_extra_args(
+    step_name: str, config_path: Path, input_base_path: Path
+) -> list[str]:
+    if step_name in {
+        "script_process_data",
+        "export_video_human_mask",
+        "dynamic_export_gs_data",
+        "script_optimize",
+        "script_train",
+        "script_inference",
+    }:
+        return [
+            "--config-path",
+            str(config_path),
+            "--base-path",
+            str(input_base_path),
+        ]
+    if step_name in {"dynamic_fast_gs", "final_eval"}:
+        return [
+            "--config-path",
+            str(config_path),
+            "--input-base-path",
+            str(input_base_path),
+        ]
+    return []
+
+
 def run_step(
-    step_name: str, script_path: Path, logs_dir: Path, python_bin: str
+    step_name: str,
+    script_path: Path,
+    logs_dir: Path,
+    python_bin: str,
+    extra_args: list[str] | None = None,
 ) -> None:
     if not script_path.exists():
         raise FileNotFoundError(f"Missing script: {script_path}")
 
     cmd = [python_bin, str(script_path)]
+    if extra_args:
+        cmd.extend(extra_args)
     print(f"\n[Pipeline] Running {step_name}: {' '.join(cmd)}")
     env = os.environ.copy()
     # Force unbuffered stdout/stderr so logs stream in real time even when piped.
@@ -244,6 +279,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory for .out/.err logs (default: ./logs).",
     )
     parser.add_argument(
+        "--config-path",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Case allowlist CSV path used by all supported stages.",
+    )
+    parser.add_argument(
+        "--input-base-path",
+        default=str(DEFAULT_INPUT_BASE_PATH),
+        help="Input case root used by all supported stages.",
+    )
+    parser.add_argument(
         "--task-name",
         default=DEFAULT_TASK_NAME,
         help="Task name for output archiving (default: exp_new_data_and_old_data).",
@@ -279,6 +324,13 @@ def main() -> int:
     archive_task_dir = get_archive_task_dir(task_name)
     logs_dir = Path(args.logs_dir).resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
+    config_path = Path(args.config_path).resolve()
+    input_base_path = Path(args.input_base_path).resolve()
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config path not found: {config_path}")
+    if not input_base_path.exists() or not input_base_path.is_dir():
+        raise FileNotFoundError(f"Input base path is not a directory: {input_base_path}")
 
     try:
         start_index = next(
@@ -294,7 +346,18 @@ def main() -> int:
                 file=sys.stderr,
             )
         for step_name, script_file in STEPS[start_index:]:
-            run_step(step_name, ROOT / script_file, logs_dir, args.python)
+            extra_args = build_step_extra_args(
+                step_name=step_name,
+                config_path=config_path,
+                input_base_path=input_base_path,
+            )
+            run_step(
+                step_name,
+                ROOT / script_file,
+                logs_dir,
+                args.python,
+                extra_args,
+            )
         archive_outputs(archive_task_dir)
         rename_stats = rename_archive_mp4_files(archive_task_dir, task_name)
     except KeyboardInterrupt:
