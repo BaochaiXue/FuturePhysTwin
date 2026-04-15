@@ -1,4 +1,5 @@
 import os
+import subprocess
 from argparse import ArgumentParser
 import time
 import logging
@@ -61,6 +62,10 @@ def existDir(dir_path):
         os.makedirs(dir_path)
 
 
+def run_checked(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
 class Timer:
     def __init__(self, task_name):
         self.task_name = task_name
@@ -81,8 +86,17 @@ class Timer:
 if PROCESS_SEG:
     # Get the masks of the controller and the object using GroundedSAM2
     with Timer("Video Segmentation"):
-        os.system(
-            f"python ./data_process/segment.py --base_path {base_path} --case_name {case_name} --TEXT_PROMPT {TEXT_PROMPT}"
+        run_checked(
+            [
+                "python",
+                "./data_process/segment.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+                "--TEXT_PROMPT",
+                TEXT_PROMPT,
+            ]
         )
 
 
@@ -102,64 +116,145 @@ if PROCESS_SHAPE_PRIOR and SHAPE_PRIOR:
     # Get the high-resolution of the image to prepare for the trellis generation
     with Timer("Image Upscale"):
         if not os.path.isfile(f"{base_path}/{case_name}/shape/high_resolution.png"):
-            os.system(
-                f"python ./data_process/image_upscale.py --img_path {base_path}/{case_name}/color/0/0.png --mask_path {mask_path} --output_path {base_path}/{case_name}/shape/high_resolution.png --category {category}"
+            run_checked(
+                [
+                    "python",
+                    "./data_process/image_upscale.py",
+                    "--img_path",
+                    f"{base_path}/{case_name}/color/0/0.png",
+                    "--mask_path",
+                    mask_path,
+                    "--output_path",
+                    f"{base_path}/{case_name}/shape/high_resolution.png",
+                    "--category",
+                    category,
+                ]
             )
 
     # Get the masked image of the object
     with Timer("Image Segmentation"):
-        os.system(
-            f"python ./data_process/segment_util_image.py --img_path {base_path}/{case_name}/shape/high_resolution.png --TEXT_PROMPT {category} --output_path {base_path}/{case_name}/shape/masked_image.png"
+        run_checked(
+            [
+                "python",
+                "./data_process/segment_util_image.py",
+                "--img_path",
+                f"{base_path}/{case_name}/shape/high_resolution.png",
+                "--TEXT_PROMPT",
+                category,
+                "--output_path",
+                f"{base_path}/{case_name}/shape/masked_image.png",
+            ]
         )
 
     with Timer("Shape Prior Generation"):
-        os.system(
-            f"python ./data_process/shape_prior.py --img_path {base_path}/{case_name}/shape/masked_image.png --output_dir {base_path}/{case_name}/shape"
+        run_checked(
+            [
+                "python",
+                "./data_process/shape_prior.py",
+                "--img_path",
+                f"{base_path}/{case_name}/shape/masked_image.png",
+                "--output_dir",
+                f"{base_path}/{case_name}/shape",
+            ]
         )
 
 if PROCESS_TRACK:
     # Get the dense tracking of the object using Co-tracker
     with Timer("Dense Tracking"):
-        os.system(
-            f"python ./data_process/dense_track.py --base_path {base_path} --case_name {case_name}"
+        run_checked(
+            [
+                "python",
+                "./data_process/dense_track.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+            ]
         )
 
 if PROCESS_3D:
     # Get the pcd in the world coordinate from the raw observations
     with Timer("Lift to 3D"):
-        os.system(
-            f"python ./data_process/data_process_pcd.py --base_path {base_path} --case_name {case_name}"
+        run_checked(
+            [
+                "python",
+                "./data_process/data_process_pcd.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+            ]
         )
 
     # Further process and filter the noise of object and controller masks
     with Timer("Mask Post-Processing"):
-        os.system(
-            f"python ./data_process/data_process_mask.py --base_path {base_path} --case_name {case_name} --controller_name {CONTROLLER_NAME}"
+        run_checked(
+            [
+                "python",
+                "./data_process/data_process_mask.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+                "--controller_name",
+                CONTROLLER_NAME,
+            ]
         )
 
     # Process the data tracking
     with Timer("Data Tracking"):
-        os.system(
-            f"python ./data_process/data_process_track.py --base_path {base_path} --case_name {case_name}"
+        run_checked(
+            [
+                "python",
+                "./data_process/data_process_track.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+            ]
         )
 
 if PROCESS_ALIGN and SHAPE_PRIOR:
     # Align the shape prior with partial observation
     with Timer("Alignment"):
-        os.system(
-            f"python ./data_process/align.py --base_path {base_path} --case_name {case_name} --controller_name {CONTROLLER_NAME}"
+        run_checked(
+            [
+                "python",
+                "./data_process/align.py",
+                "--base_path",
+                base_path,
+                "--case_name",
+                case_name,
+                "--controller_name",
+                CONTROLLER_NAME,
+            ]
         )
 
 if PROCESS_FINAL:
     # Get the final PCD used for the inverse physics with/without the shape prior
     with Timer("Final Data Generation"):
         if SHAPE_PRIOR:
-            os.system(
-                f"python ./data_process/data_process_sample.py --base_path {base_path} --case_name {case_name} --shape_prior"
+            run_checked(
+                [
+                    "python",
+                    "./data_process/data_process_sample.py",
+                    "--base_path",
+                    base_path,
+                    "--case_name",
+                    case_name,
+                    "--shape_prior",
+                ]
             )
         else:
-            os.system(
-                f"python ./data_process/data_process_sample.py --base_path {base_path} --case_name {case_name}"
+            run_checked(
+                [
+                    "python",
+                    "./data_process/data_process_sample.py",
+                    "--base_path",
+                    base_path,
+                    "--case_name",
+                    case_name,
+                ]
             )
 
     # Save the train test split

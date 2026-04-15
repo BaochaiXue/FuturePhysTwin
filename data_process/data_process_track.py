@@ -28,6 +28,11 @@ def exist_dir(dir):
         os.makedirs(dir)
 
 
+def in_bounds(coord_y: int, coord_x: int, shape: tuple[int, int]) -> bool:
+    height, width = shape
+    return 0 <= coord_y < height and 0 <= coord_x < width
+
+
 def getSphereMesh(center, radius=0.1, color=[0, 0, 0]):
     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius).translate(center)
     sphere.paint_uniform_color(color)
@@ -88,9 +93,12 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
             controller_mask = processed_masks[frame_idx][i]["controller"]
             for j in range(num_points):
                 if track_controller_idx[j] == 1 and visibility[frame_idx, j] == 1:
-                    if not controller_mask[
-                        tracks[frame_idx, j, 0], tracks[frame_idx, j, 1]
-                    ]:
+                    coord_y = tracks[frame_idx, j, 0]
+                    coord_x = tracks[frame_idx, j, 1]
+                    if not in_bounds(coord_y, coord_x, controller_mask.shape):
+                        visibility[frame_idx, j] = 0
+                        continue
+                    if not controller_mask[coord_y, coord_x]:
                         visibility[frame_idx, j] = 0
 
         # Get the track point cloud
@@ -100,14 +108,37 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
             data = np.load(f"{pcd_path}/{frame_idx}.npz")
             points = data["points"]
             colors = data["colors"]
+            visible_indices = np.where(visibility[frame_idx])[0]
+            if visible_indices.size == 0:
+                continue
 
-            track_points[frame_idx][np.where(visibility[frame_idx])] = points[i][
-                tracks[frame_idx, np.where(visibility[frame_idx])[0], 0],
-                tracks[frame_idx, np.where(visibility[frame_idx])[0], 1],
+            point_grid = points[i]
+            color_grid = colors[i]
+            height, width = point_grid.shape[:2]
+            coords = tracks[frame_idx, visible_indices]
+            in_bound_mask = np.logical_and.reduce(
+                (
+                    coords[:, 0] >= 0,
+                    coords[:, 0] < height,
+                    coords[:, 1] >= 0,
+                    coords[:, 1] < width,
+                )
+            )
+            if not np.all(in_bound_mask):
+                dropped = visible_indices[~in_bound_mask]
+                visibility[frame_idx, dropped] = 0
+                visible_indices = visible_indices[in_bound_mask]
+                coords = coords[in_bound_mask]
+            if visible_indices.size == 0:
+                continue
+
+            track_points[frame_idx][visible_indices] = point_grid[
+                coords[:, 0],
+                coords[:, 1],
             ]
-            track_colors[frame_idx][np.where(visibility[frame_idx])] = colors[i][
-                tracks[frame_idx, np.where(visibility[frame_idx])[0], 0],
-                tracks[frame_idx, np.where(visibility[frame_idx])[0], 1],
+            track_colors[frame_idx][visible_indices] = color_grid[
+                coords[:, 0],
+                coords[:, 1],
             ]
 
         object_points.append(track_points[:, np.where(track_object_idx)[0], :])
