@@ -57,6 +57,19 @@ command used to create or fetch it in the task brief.
 - Force/material visualization: start from `visualize_force.py` and
   `visualize_material.py`.
 
+## External Runtime Notes
+
+- SAM 3D Objects for this machine is installed in the external checkout
+  `/home/zhangxinjie/external/sam-3d-objects` and tested from conda env
+  `demo_3_max`.
+- The SAM3D Hugging Face checkpoint directory is
+  `/home/zhangxinjie/external/sam-3d-objects/checkpoints/hf`.
+- WSL Hugging Face auth worked as `XinjieZhang` during the 2026-05-10 smoke;
+  Windows-side fallback was not required.
+- Before changing this environment, read
+  `docs/plans/completed/2026-05-10-sam3d-demo3-max/qa-report.md` and
+  `docs/plans/completed/2026-05-10-sam3d-runtime-test/qa-report.md`.
+
 ## Context Boundaries
 
 Keep PhysTwin documentation upstream-facing. Bridge-specific or external system
