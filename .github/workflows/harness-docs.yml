@@ -1,0 +1,30 @@
+name: Harness Docs
+
+on:
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "HARNESS.md"
+      - "docs/harness/**"
+      - "docs/plans/**"
+      - "scripts/check_harness_docs.py"
+      - ".github/workflows/harness-docs.yml"
+  push:
+    paths:
+      - "AGENTS.md"
+      - "HARNESS.md"
+      - "docs/harness/**"
+      - "docs/plans/**"
+      - "scripts/check_harness_docs.py"
+      - ".github/workflows/harness-docs.yml"
+
+jobs:
+  harness-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Validate harness documentation
+        run: python scripts/check_harness_docs.py
