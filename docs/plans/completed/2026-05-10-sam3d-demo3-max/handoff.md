@@ -36,6 +36,9 @@ PyTorch, torchvision, and CUDA runtime versions.
   `sam3d_objects.pipeline.inference_pipeline_pointmap`, and notebook
   `inference`.
 
+- Command: `spconv` CUDA smoke
+- Result: passed. A small `SubMConv3d` executed on `cuda:0`, RTX 5090.
+
 ## Next Agent Should Read
 
 1. `AGENTS.md`
@@ -49,7 +52,8 @@ PyTorch, torchvision, and CUDA runtime versions.
   available.
 - Follow-up: decide whether to keep `kaolin-compat` as a local shim or port
   Kaolin 0.17.0 to PyTorch 2.11 if broader Kaolin APIs become necessary.
-- Follow-up: runtime-test sparse convolution under a real SAM3D model load.
+- Follow-up: runtime-test the complete sparse model path under a real SAM3D
+  model load.
 - Blocker: no blocker for import-level compatibility.
 
 ## Notes

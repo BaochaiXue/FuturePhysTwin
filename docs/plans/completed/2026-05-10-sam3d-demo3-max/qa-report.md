@@ -45,6 +45,7 @@ Result:
 - PyTorch stayed at `2.11.0+cu130`; Torch CUDA stayed at `13.0`.
 - `gsplat` built from source with `-gencode=arch=compute_120,code=sm_120`.
 - Patched PyTorch3D imports passed with `PYTORCH3D_DISABLE_PULSAR=1`.
+- `spconv` CUDA smoke passed on RTX 5090 with a small `SubMConv3d`.
 
 ## Source Revisions
 
@@ -98,9 +99,9 @@ Result:
 
 ## Residual Risk
 
-- Risk: `spconv==2.3.8` imports, but this is the generic package rather than
-  SAM3D's official `spconv-cu121` wheel. Runtime sparse convolution should be
-  tested with a real model path before production use.
+- Risk: `spconv==2.3.8` imports and a small CUDA sparse convolution passes,
+  but this is the generic package rather than SAM3D's official `spconv-cu121`
+  wheel. Test the full sparse model path before production use.
 - Risk: `kaolin-compat` is intentionally narrow. If future code uses more
   Kaolin APIs than the current SAM3D imports, either extend the shim or port
   Kaolin 0.17.0 to PyTorch 2.11.
