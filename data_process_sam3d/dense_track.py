@@ -16,6 +16,12 @@ parser.add_argument(
     required=True,
 )
 parser.add_argument("--case_name", type=str, required=True)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="Seed for deterministic CoTracker query-point subsampling.",
+)
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -36,6 +42,15 @@ def read_mask(mask_path):
 def exist_dir(dir):
     if not os.path.exists(dir):
         os.makedirs(dir)
+
+
+def subsample_query_pixels(query_pixels, num_queries, seed, camera_idx):
+    generator = torch.Generator(device=query_pixels.device)
+    generator.manual_seed(int(seed) + int(camera_idx))
+    permutation = torch.randperm(
+        query_pixels.shape[0], device=query_pixels.device, generator=generator
+    )
+    return query_pixels[permutation[:num_queries]]
 
 
 if __name__ == "__main__":
@@ -67,7 +82,7 @@ if __name__ == "__main__":
         )
         query_pixels = torch.tensor(query_pixels, dtype=torch.float32).to(device)
         # Randomly select 5000 query points
-        query_pixels = query_pixels[torch.randperm(query_pixels.shape[0])[:5000]]
+        query_pixels = subsample_query_pixels(query_pixels, 5000, args.seed, i)
 
         # cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
         # pred_tracks, pred_visibility = cotracker(video, queries=query_pixels[None], backward_tracking=True)
