@@ -81,7 +81,9 @@ if __name__ == "__main__":
             [np.zeros((query_pixels.shape[0], 1)), query_pixels], axis=1
         )
         query_pixels = torch.tensor(query_pixels, dtype=torch.float32).to(device)
-        # Randomly select 5000 query points
+        # Randomly select exactly 5000 query points in strict mode.
+        if query_pixels.shape[0] < 5000:
+            raise ValueError(f"Too few query pixels: {query_pixels.shape[0]}")
         query_pixels = subsample_query_pixels(query_pixels, 5000, args.seed, i)
 
         # cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
