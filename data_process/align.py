@@ -64,6 +64,7 @@ def pose_selection_render_superglue(
 ):
     # Calculate suitable rendering radius
     bounding_box = mesh.bounds
+    # shape: bounding_box (2, 3), min/max mesh bounds.
     max_dimension = np.linalg.norm(bounding_box[1] - bounding_box[0])
     radius = 2 * (max_dimension / 2) / np.tan(fov / 2)
 
@@ -78,6 +79,7 @@ def pose_selection_render_superglue(
         num_ups=4,
         device="cuda",
     )
+    # shape: colors (P, H, W, 3); depths (P, H, W); camera_poses (P, 4, 4); camera_intrinsics (3, 3).
     grays = [cv2.cvtColor(color, cv2.COLOR_BGR2GRAY) for color in colors]
     # Use superglue to match the features
     best_idx, match_result = image_pair_matching(
@@ -88,11 +90,13 @@ def pose_selection_render_superglue(
     best_color = colors[best_idx]
     best_depth = depths[best_idx]
     best_pose = camera_poses[best_idx].cpu().numpy()
+    # shape: best_color (H, W, 3); best_depth (H, W); best_pose (4, 4).
     return best_color, best_depth, best_pose, match_result, camera_intrinsics
 
 
 def registration_pnp(mesh_matching_points, raw_matching_points, intrinsic):
     # Solve the PNP and verify the reprojection error
+    # shape: mesh_matching_points (K, 3); raw_matching_points (K, 2); intrinsic (3, 3).
     success, rvec, tvec = cv2.solvePnP(
         np.float32(mesh_matching_points),
         np.float32(raw_matching_points),
@@ -108,17 +112,21 @@ def registration_pnp(mesh_matching_points, raw_matching_points, intrinsic):
         intrinsic,
         np.zeros(4, dtype=np.float32),
     )
+    # shape: projected_points (K, 1, 2); rvec/tvec (3, 1).
     error = np.linalg.norm(
         np.float32(raw_matching_points) - projected_points.reshape(-1, 2), axis=1
     ).mean()
+    # shape: projected_points.reshape(-1, 2) is (K, 2).
     print(f"Reprojection Error: {error}")
     if error > 50:
         print(f"solvePnP failed for this case {case_name}.$$$$$$$$$$$$$$$$$$$$$$$$$$")
 
     rotation_matrix, _ = cv2.Rodrigues(rvec)
     mesh2raw_camera = np.eye(4, dtype=np.float32)
+    # shape: mesh2raw_camera (4, 4).
     mesh2raw_camera[:3, :3] = rotation_matrix
     mesh2raw_camera[:3, 3] = tvec.squeeze()
+    # shape: tvec.squeeze() (3,).
 
     return mesh2raw_camera
 
@@ -127,6 +135,7 @@ def registration_scale(mesh_matching_points_cam, matching_points_cam):
     # After PNP, optimize the scale in the camera coordinate
     def objective(scale, mesh_points, pcd_points):
         transformed_points = scale * mesh_points
+        # shape: transformed_points (K, 3).
         loss = np.sum(np.sum((transformed_points - pcd_points) ** 2, axis=1))
         return loss
 
@@ -145,9 +154,11 @@ def registration_scale(mesh_matching_points_cam, matching_points_cam):
 def deform_ARAP(initial_mesh_world, mesh_matching_points_world, matching_points):
     # Do the ARAP deformation based on the matching keypoints
     mesh_vertices = np.asarray(initial_mesh_world.vertices)
+    # shape: mesh_vertices (V, 3).
     kdtree = KDTree(mesh_vertices)
     _, mesh_points_indices = kdtree.query(mesh_matching_points_world)
     mesh_points_indices = np.asarray(mesh_points_indices, dtype=np.int32)
+    # shape: mesh_matching_points_world/matching_points (K, 3); mesh_points_indices (K,).
     deform_mesh = initial_mesh_world.deform_as_rigid_as_possible(
         o3d.utility.IntVector(mesh_points_indices),
         o3d.utility.Vector3dVector(matching_points),
@@ -164,7 +175,9 @@ def get_matching_ray_registration(
         w2c,
         np.hstack((obs_points_world, np.ones((obs_points_world.shape[0], 1)))).T,
     ).T
+    # shape: obs_points_world (N_obs, 3) -> obs_points_cam homogeneous (N_obs, 4).
     obs_points_cam = obs_points_cam[:, :3]
+    # shape: obs_points_cam (N_obs, 3).
     vertices_cam = np.dot(
         w2c,
         np.hstack(
@@ -174,7 +187,9 @@ def get_matching_ray_registration(
             )
         ).T,
     ).T
+    # shape: vertices_cam homogeneous (V, 4).
     vertices_cam = vertices_cam[:, :3]
+    # shape: vertices_cam (V, 3).
 
     obs_kd = KDTree(obs_points_cam)
 
@@ -182,11 +197,14 @@ def get_matching_ray_registration(
     new_targets = []
     # trimesh used to do the ray-casting test
     mesh.vertices = np.asarray(vertices_cam)[trimesh_indices]
+    # shape: mesh.vertices (Fitted_V, 3), indexed back to trimesh vertex order.
     for index, vertex in enumerate(vertices_cam):
         ray_origins = np.array([[0, 0, 0]])
+        # shape: ray_origins (1, 3).
         ray_direction = vertex
         ray_direction = ray_direction / np.linalg.norm(ray_direction)
         ray_directions = np.array([ray_direction])
+        # shape: ray_directions (1, 3).
         locations, _, _ = mesh.ray.intersects_location(
             ray_origins=ray_origins, ray_directions=ray_directions, multiple_hits=False
         )
@@ -213,11 +231,13 @@ def get_matching_ray_registration(
                 target = np.dot(
                     c2w, np.hstack((obs_points_cam[indices][closest_index], 1))
                 )
+                # shape: target (4,), homogeneous world point.
                 new_indices.append(index)
                 new_targets.append(target[:3])
 
     new_indices = np.asarray(new_indices)
     new_targets = np.asarray(new_targets)
+    # shape: new_indices (K_ray,); new_targets (K_ray, 3).
 
     return new_indices, new_targets
 
@@ -250,10 +270,12 @@ def deform_ARAP_ray_registration(
 
     # Also need to adjust the positions to make sure they are above the table
     indices = np.where(np.asarray(deform_kp_mesh_world.vertices)[:, 2] > 0)[0]
+    # shape: indices (K_ground,), vertices above the table plane.
     for index in indices:
         if index not in final_indices:
             final_indices.append(index)
             target = np.asarray(deform_kp_mesh_world.vertices)[index].copy()
+            # shape: target (3,).
             target[2] = 0
             final_targets.append(target)
         else:
@@ -275,6 +297,7 @@ def line_point_distance(p, points):
     p = p / np.linalg.norm(p)
     points_to_origin = points
     cross_product = np.linalg.norm(np.cross(points_to_origin, p), axis=1)
+    # shape: points (N, 3); cross_product (N,).
     return cross_product / np.linalg.norm(p)
 
 
@@ -298,6 +321,7 @@ if __name__ == "__main__":
     with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
         data = json.load(f)
     intrinsic = np.array(data["intrinsics"])[cam_idx]
+    # shape: intrinsic (3, 3).
 
     # Load the c2w for the camera
     with open(f"{base_path}/{case_name}/calibrate.pkl", "rb") as f:
@@ -305,6 +329,7 @@ if __name__ == "__main__":
         c2w = c2ws[cam_idx]
         w2c = np.linalg.inv(c2w)
         w2cs = [np.linalg.inv(c2w) for c2w in c2ws]
+        # shape: c2ws list of (4, 4); c2w/w2c each (4, 4).
 
     # Load the shape prior
     mesh = trimesh.load_mesh(mesh_path, force="mesh")
@@ -313,8 +338,10 @@ if __name__ == "__main__":
     # Load and process the image to get a cropped version for easy superglue
     raw_img = cv2.imread(img_path)
     raw_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+    # shape: raw_img (H, W, 3), RGB.
     # Get mask bounding box, larger than the original bounding box
     mask_img = cv2.imread(mask_img_path, cv2.IMREAD_GRAYSCALE)
+    # shape: mask_img (H, W).
 
     # Calculate camera parameters
     fov = 2 * np.arctan(raw_img.shape[1] / (2 * intrinsic[0, 0]))
@@ -355,6 +382,7 @@ if __name__ == "__main__":
     if cached_payload is None:
         # 2D feature Matching to get the best pose of the object
         bbox = np.argwhere(mask_img > 0.8 * 255)
+        # shape: bbox (N_mask, 2), rows are (y, x) foreground pixels.
         bbox = (
             np.min(bbox[:, 1]),
             np.min(bbox[:, 0]),
@@ -380,9 +408,11 @@ if __name__ == "__main__":
         # Get the masked cropped image used for superglue
         crop_img = raw_img.copy()
         mask_bool = mask_img > 0
+        # shape: mask_bool (H, W).
         crop_img[~mask_bool] = 0
         crop_img = crop_img[bbox[1] : bbox[3], bbox[0] : bbox[2]]
         crop_img = cv2.cvtColor(crop_img, cv2.COLOR_RGB2GRAY)
+        # shape: crop_img (H_crop, W_crop).
 
         # Render the object and match the features
         best_color, best_depth, best_pose, match_result, camera_intrinsics = (
@@ -427,16 +457,19 @@ if __name__ == "__main__":
     # Get the projected 3D matching points on the mesh
     valid_matches = match_result["matches"] > -1
     render_matching_points = match_result["keypoints0"][valid_matches]
+    # shape: valid_matches (N_render_kpts,); render_matching_points (K, 2).
     mesh_matching_points, valid_mask = project_2d_to_3d(
         render_matching_points, best_depth, camera_intrinsics, best_pose
     )
     render_matching_points = render_matching_points[valid_mask]
+    # shape: mesh_matching_points (K_valid, 3); valid_mask (K,); render_matching_points (K_valid, 2).
     # Get the matching points on the raw image
     raw_matching_points_box = match_result["keypoints1"][
         match_result["matches"][valid_matches]
     ]
     raw_matching_points_box = raw_matching_points_box[valid_mask]
     raw_matching_points = raw_matching_points_box + np.array([bbox[0], bbox[1]])
+    # shape: raw_matching_points_box/raw_matching_points (K_valid, 2).
 
     if VIS:
         # Do visualization for the matching
@@ -463,6 +496,7 @@ if __name__ == "__main__":
 
     if VIS:
         pnp_camera_pose = np.eye(4, dtype=np.float32)
+        # shape: pnp_camera_pose (4, 4).
         pnp_camera_pose[:3, :3] = np.linalg.inv(mesh2raw_camera[:3, :3])
         pnp_camera_pose[3, :3] = mesh2raw_camera[:3, 3]
         pnp_camera_pose[:, :2] = -pnp_camera_pose[:, :2]
@@ -470,6 +504,7 @@ if __name__ == "__main__":
             mesh_path, pnp_camera_pose, raw_img.shape[1], raw_img.shape[0], fov, "cuda"
         )
         vis_mask = depth > 0
+        # shape: color (1, H, W, 3); depth/vis_mask (H, W) when rendering one pose.
         color[0][~vis_mask] = raw_img[~vis_mask]
         plt.imsave(f"{output_dir}/pnp_results.png", color[0])
 
@@ -480,7 +515,9 @@ if __name__ == "__main__":
             (mesh_matching_points, np.ones((mesh_matching_points.shape[0], 1)))
         ).T,
     ).T
+    # shape: mesh_matching_points_cam homogeneous (K_valid, 4).
     mesh_matching_points_cam = mesh_matching_points_cam[:, :3]
+    # shape: mesh_matching_points_cam (K_valid, 3).
 
     # Load the pcd in world coordinate of raw image matching points
     obs_points = []
@@ -496,12 +533,14 @@ if __name__ == "__main__":
         mask = processed_masks[0][i]["object"]
         obs_points.append(points[mask])
         obs_colors.append(colors[mask])
+        # shape: points/colors (H, W, 3); mask (H, W); appended obs arrays (N_i, 3).
         if i == 0:
             first_points = points
             first_mask = mask
 
     obs_points = np.vstack(obs_points)
     obs_colors = np.vstack(obs_colors)
+    # shape: obs_points/obs_colors (N_obs, 3).
 
     # Find the cloest points for the raw_matching_points
     new_match, matching_points = select_point(
@@ -510,7 +549,9 @@ if __name__ == "__main__":
     matching_points_cam = np.dot(
         w2c, np.hstack((matching_points, np.ones((matching_points.shape[0], 1)))).T
     ).T
+    # shape: matching_points_cam homogeneous (K_valid, 4).
     matching_points_cam = matching_points_cam[:, :3]
+    # shape: matching_points_cam (K_valid, 3).
 
     if VIS:
         # Draw the raw_matching_points and new matching points on the masked
@@ -528,8 +569,10 @@ if __name__ == "__main__":
 
     # Compute the rigid transformation from the original mesh to the final world coordinate
     scale_matrix = np.eye(4) * optimal_scale
+    # shape: scale_matrix (4, 4).
     scale_matrix[3, 3] = 1
     mesh2world = np.dot(c2w, np.dot(scale_matrix, mesh2raw_camera))
+    # shape: mesh2world (4, 4).
 
     mesh_matching_points_world = np.dot(
         mesh2world,
@@ -537,19 +580,23 @@ if __name__ == "__main__":
             (mesh_matching_points, np.ones((mesh_matching_points.shape[0], 1)))
         ).T,
     ).T
+    # shape: mesh_matching_points_world homogeneous (K_valid, 4).
     mesh_matching_points_world = mesh_matching_points_world[:, :3]
+    # shape: mesh_matching_points_world (K_valid, 3).
 
     # Do the ARAP based on the matching keypoints
     # Convert the mesh to open3d to use the ARAP function
     initial_mesh_world = o3d.geometry.TriangleMesh()
     initial_mesh_world.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
     initial_mesh_world.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
+    # shape: mesh.vertices (V, 3); mesh.faces (F, 3).
     # Need to remove the duplicated vertices to enable open3d, however, the duplicated points are important in trimesh for texture
     initial_mesh_world = initial_mesh_world.remove_duplicated_vertices()
     # Get the index from original vertices to the mesh vertices, mapping between trimesh and open3d
     kdtree = KDTree(initial_mesh_world.vertices)
     _, trimesh_indices = kdtree.query(np.asarray(mesh.vertices))
     trimesh_indices = np.asarray(trimesh_indices, dtype=np.int32)
+    # shape: trimesh_indices (V_trimesh,).
     initial_mesh_world.transform(mesh2world)
 
     # ARAP based on the keypoints
@@ -584,6 +631,7 @@ if __name__ == "__main__":
         vis = o3d.visualization.Visualizer()
         vis.create_window(visible=False)
         dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+        # shape: dummy_frame (H_render, W_render, 3), float RGB.
         height, width, _ = dummy_frame.shape
         fourcc = cv2.VideoWriter_fourcc(*"avc1")
         video_writer = cv2.VideoWriter(
@@ -603,10 +651,12 @@ if __name__ == "__main__":
             vis.poll_events()
             vis.update_renderer()
             frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+            # shape: frame (H_render, W_render, 3), float RGB.
             frame = (frame * 255).astype(np.uint8)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             video_writer.write(frame)
         vis.destroy_window()
 
     mesh.vertices = np.asarray(final_mesh_world.vertices)[trimesh_indices]
+    # shape: mesh.vertices (V_trimesh, 3), restored to trimesh vertex order.
     mesh.export(f"{output_dir}/final_mesh.glb")

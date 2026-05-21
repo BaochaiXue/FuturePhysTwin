@@ -36,6 +36,7 @@ def read_mask(mask_path):
     # Convert the white mask into binary mask
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     mask = mask > 0
+    # shape: mask (H, W), boolean foreground.
     return mask
 
 
@@ -48,6 +49,7 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
     points = data["points"]
     colors = data["colors"]
     masks = data["masks"]
+    # shape: points/colors (Cams, H, W, 3); masks (Cams, H, W).
 
     object_pcd = o3d.geometry.PointCloud()
     controller_pcd = o3d.geometry.PointCloud()
@@ -59,6 +61,7 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
         object_mask = np.logical_and(masks[i], mask)
         object_points = points[i][object_mask]
         object_colors = colors[i][object_mask]
+        # shape: object_mask (H, W); object_points/object_colors (N_obj_i, 3).
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(object_points)
         pcd.colors = o3d.utility.Vector3dVector(object_colors)
@@ -66,12 +69,14 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
 
         # Load the controller mask
         controller_mask = np.zeros_like(masks[i])
+        # shape: controller_mask (H, W).
         for controller_idx in mask_info[i]["controller"]:
             mask = read_mask(f"{mask_path}/{i}/{controller_idx}/{frame_idx}.png")
             controller_mask = np.logical_or(controller_mask, mask)
         controller_mask = np.logical_and(masks[i], controller_mask)
         controller_points = points[i][controller_mask]
         controller_colors = colors[i][controller_mask]
+        # shape: controller_points/controller_colors (N_ctrl_i, 3).
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(controller_points)
@@ -83,12 +88,14 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
     filtered_object_points = np.asarray(
         object_pcd.select_by_index(ind, invert=True).points
     )
+    # shape: filtered_object_points (N_obj_outlier, 3).
     object_pcd = object_pcd.select_by_index(ind)
 
     cl, ind = controller_pcd.remove_radius_outlier(nb_points=40, radius=0.01)
     filtered_controller_points = np.asarray(
         controller_pcd.select_by_index(ind, invert=True).points
     )
+    # shape: filtered_controller_points (N_ctrl_outlier, 3).
     controller_pcd = controller_pcd.select_by_index(ind)
 
     # controller_pcd.paint_uniform_color([1, 0, 0])
@@ -104,6 +111,7 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
         object_points = points[i][object_mask]
         indices = np.nonzero(object_mask)
         indices_list = list(zip(indices[0], indices[1]))
+        # shape: object_mask (H, W); object_points (N_obj_i, 3).
         # Locate all the object_points in the filtered points
         object_indices = []
         for j, point in enumerate(object_points):
@@ -117,6 +125,7 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
 
         # Load the controller mask
         controller_mask = np.zeros_like(masks[i])
+        # shape: controller_mask (H, W).
         for controller_idx in mask_info[i]["controller"]:
             mask = read_mask(f"{mask_path}/{i}/{controller_idx}/{frame_idx}.png")
             controller_mask = np.logical_or(controller_mask, mask)
@@ -124,6 +133,7 @@ def process_pcd_mask(frame_idx, pcd_path, mask_path, mask_info, num_cam):
         controller_points = points[i][controller_mask]
         indices = np.nonzero(controller_mask)
         indices_list = list(zip(indices[0], indices[1]))
+        # shape: controller_points (N_ctrl_i, 3); controller_mask (H, W).
         # Locate all the controller_points in the filtered points
         controller_indices = []
         for j, point in enumerate(controller_points):

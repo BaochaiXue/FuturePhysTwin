@@ -3,5 +3,7 @@
     "/home/xinjie/FuturePhysTwin/sam-3d-objects",
     "/home/xinjie/FuturePhysTwin/sam2",
     "/home/xinjie/FuturePhysTwin/data_process/TRELLIS"
-  ]
+  ],
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

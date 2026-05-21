@@ -57,18 +57,21 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
         tracks = current_track_data["tracks"]
         tracks = np.round(tracks).astype(int)
         visibility = current_track_data["visibility"]
+        # shape: tracks (T, N_i, 2) in (y, x); visibility (T, N_i).
         assert tracks.shape[0] == frame_num
         num_points = np.shape(tracks)[1]
 
         # Locate the track points in the object mask of the first frame
         object_mask = processed_masks[0][i]["object"]
         track_object_idx = np.zeros((num_points), dtype=int)
+        # shape: object_mask (H, W); track_object_idx (N_i,).
         for j in range(num_points):
             if visibility[0, j] == 1:
                 track_object_idx[j] = object_mask[tracks[0, j, 0], tracks[0, j, 1]]
         # Locate the controller points in the controller mask of the first frame
         controller_mask = processed_masks[0][i]["controller"]
         track_controller_idx = np.zeros((num_points), dtype=int)
+        # shape: controller_mask (H, W); track_controller_idx (N_i,).
         for j in range(num_points):
             if visibility[0, j] == 1:
                 track_controller_idx[j] = controller_mask[
@@ -104,11 +107,13 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
         # Get the track point cloud
         track_points = np.zeros((frame_num, num_points, 3))
         track_colors = np.zeros((frame_num, num_points, 3))
+        # shape: track_points/track_colors (T, N_i, 3).
         for frame_idx in range(frame_num):
             data = np.load(f"{pcd_path}/{frame_idx}.npz")
             points = data["points"]
             colors = data["colors"]
             visible_indices = np.where(visibility[frame_idx])[0]
+            # shape: points/colors (Cams, H, W, 3); visible_indices (V_i,).
             if visible_indices.size == 0:
                 continue
 
@@ -116,6 +121,7 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
             color_grid = colors[i]
             height, width = point_grid.shape[:2]
             coords = tracks[frame_idx, visible_indices]
+            # shape: point_grid/color_grid (H, W, 3); coords (V_i, 2).
             in_bound_mask = np.logical_and.reduce(
                 (
                     coords[:, 0] >= 0,
@@ -124,6 +130,7 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
                     coords[:, 1] < width,
                 )
             )
+            # shape: in_bound_mask (V_i,).
             if not np.all(in_bound_mask):
                 dropped = visible_indices[~in_bound_mask]
                 visibility[frame_idx, dropped] = 0
@@ -147,6 +154,7 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
         controller_points.append(track_points[:, np.where(track_controller_idx)[0], :])
         controller_colors.append(track_colors[:, np.where(track_controller_idx)[0], :])
         controller_visibilities.append(visibility[:, np.where(track_controller_idx)[0]])
+        # shape per appended camera: object/controller points/colors (T, N_cam, 3); visibilities (T, N_cam).
 
     object_points = np.concatenate(object_points, axis=1)
     object_colors = np.concatenate(object_colors, axis=1)
@@ -154,6 +162,7 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
     controller_points = np.concatenate(controller_points, axis=1)
     controller_colors = np.concatenate(controller_colors, axis=1)
     controller_visibilities = np.concatenate(controller_visibilities, axis=1)
+    # shape: object/controller points/colors (T, N_total, 3); visibilities (T, N_total).
 
     track_data = {}
     track_data["object_points"] = object_points
@@ -174,6 +183,7 @@ def filter_motion(track_data, neighbor_dist=0.01):
     object_motions = np.zeros_like(object_points)
     object_motions[:-1] = object_points[1:] - object_points[:-1]
     object_motions_valid = np.zeros_like(object_visibilities)
+    # shape: object_motions (T, N_obj, 3); object_motions_valid (T, N_obj).
     object_motions_valid[:-1] = np.logical_and(
         object_visibilities[:-1], object_visibilities[1:]
     )
@@ -181,6 +191,7 @@ def filter_motion(track_data, neighbor_dist=0.01):
     y_min, y_max = np.min(object_points[0, :, 1]), np.max(object_points[0, :, 1])
     y_normalized = (object_points[0, :, 1] - y_min) / (y_max - y_min)
     rainbow_colors = plt.cm.rainbow(y_normalized)[:, :3]
+    # shape: y_normalized (N_obj,); rainbow_colors (N_obj, 3).
 
     num_frames = object_points.shape[0]
     num_points = object_points.shape[1]
@@ -212,6 +223,7 @@ def filter_motion(track_data, neighbor_dist=0.01):
             motion_diff = np.linalg.norm(
                 object_motions[i, j] - object_motions[i, neighbors], axis=1
             )
+            # shape: motion_diff (N_neighbors,).
             if (motion_diff < neighbor_dist / 2).sum() < 0.5 * len(neighbors):
                 object_motions_valid[i, j] = 0
                 # modified_points.append(object_points[i, j])
@@ -279,18 +291,21 @@ def filter_motion(track_data, neighbor_dist=0.01):
     controller_motions = np.zeros_like(controller_points)
     controller_motions[:-1] = controller_points[1:] - controller_points[:-1]
     controller_motions_valid = np.zeros_like(controller_visibilities)
+    # shape: controller_motions (T, N_ctrl, 3); controller_motions_valid (T, N_ctrl).
     controller_motions_valid[:-1] = np.logical_and(
         controller_visibilities[:-1], controller_visibilities[1:]
     )
     num_points = controller_points.shape[1]
     # Filter all points that disappear in the sequence
     mask = np.prod(controller_visibilities, axis=0)
+    # shape: mask (N_ctrl,), true for controller tracks visible across all frames.
 
     y_min, y_max = np.min(controller_points[0, :, 1]), np.max(
         controller_points[0, :, 1]
     )
     y_normalized = (controller_points[0, :, 1] - y_min) / (y_max - y_min)
     rainbow_colors = plt.cm.rainbow(y_normalized)[:, :3]
+    # shape: y_normalized (N_ctrl,); rainbow_colors (N_ctrl, 3).
 
     vis = o3d.visualization.Visualizer()
     vis.create_window()
@@ -322,6 +337,7 @@ def filter_motion(track_data, neighbor_dist=0.01):
             motion_diff = np.linalg.norm(
                 controller_motions[i, j] - controller_motions[i, neighbors], axis=1
             )
+            # shape: motion_diff (N_neighbors,).
             if (motion_diff < neighbor_dist / 2).sum() < 0.5 * len(neighbors):
                 controller_motions_valid[i, j] = 0
                 mask[j] = 0
@@ -362,15 +378,18 @@ def get_final_track_data(track_data, controller_threhsold=0.01):
     mask = track_data["controller_mask"]
 
     new_controller_points = controller_points[:, np.where(mask)[0], :]
+    # shape: new_controller_points (T, N_valid_ctrl, 3).
     assert len(new_controller_points[0]) >= 30
     # Do farthest point sampling on the valid controller points to select the final controller points
     valid_indices = np.arange(len(new_controller_points[0]))
+    # shape: valid_indices (N_valid_ctrl,).
     points_map = {}
     sample_points = []
     for i in valid_indices:
         points_map[tuple(new_controller_points[0, i])] = i
         sample_points.append(new_controller_points[0, i])
     sample_points = np.array(sample_points)
+    # shape: sample_points (N_valid_ctrl, 3).
     sample_pcd = o3d.geometry.PointCloud()
     sample_pcd.points = o3d.utility.Vector3dVector(sample_points)
     fps_pcd = sample_pcd.farthest_point_down_sample(30)
@@ -382,6 +401,7 @@ def get_final_track_data(track_data, controller_threhsold=0.01):
 
     # Get the nearest controller points and their colors
     nearest_controller_points = new_controller_points[:, final_indices]
+    # shape: nearest_controller_points (T, 30, 3).
 
     # object_pcd = o3d.geometry.PointCloud()
     # object_pcd.points = o3d.utility.Vector3dVector(valid_object_points)
@@ -412,6 +432,7 @@ def visualize_track(track_data):
     object_visibilities = track_data["object_visibilities"]
     object_motions_valid = track_data["object_motions_valid"]
     controller_points = track_data["controller_points"]
+    # shape: object_points/object_colors (T, N_obj, 3); object_visibilities/object_motions_valid (T, N_obj); controller_points (T, N_ctrl, 3).
 
     frame_num = object_points.shape[0]
 
@@ -423,6 +444,7 @@ def visualize_track(track_data):
     y_min, y_max = np.min(object_points[0, :, 1]), np.max(object_points[0, :, 1])
     y_normalized = (object_points[0, :, 1] - y_min) / (y_max - y_min)
     rainbow_colors = plt.cm.rainbow(y_normalized)[:, :3]
+    # shape: y_normalized (N_obj,); rainbow_colors (N_obj, 3).
 
     for i in range(frame_num):
         object_pcd = o3d.geometry.PointCloud()

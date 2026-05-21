@@ -99,6 +99,7 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
 
     mask_a_bool = mask_a.astype(bool)
     mask_b_bool = mask_b.astype(bool)
+    # shape: mask_a_bool and mask_b_bool are both (H, W).
     intersection = np.logical_and(mask_a_bool, mask_b_bool).sum()
     union = mask_a_bool.sum() + mask_b_bool.sum() - intersection
     if union == 0:
@@ -130,6 +131,7 @@ def infer_required_label_min_count(
 def select_top_indices_by_confidence(
     indices: List[int], confidences: torch.Tensor, top_k: int
 ) -> List[int]:
+    # shape: confidences is (N,), indices selects rows from that detection set.
     ranked = sorted(indices, key=lambda idx: float(confidences[idx]), reverse=True)
     return ranked[:top_k]
 
@@ -210,6 +212,7 @@ Step 2: Prompt Grounding DINO 1.5 with Cloud API for box coordinates
 # prompt grounding dino to get the box coordinates on specific frame
 img_path = os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[ann_frame_idx])
 image_source, image = load_image(img_path)
+# shape: image_source (H, W, 3); image is GroundingDINO input (C, H_dino, W_dino).
 
 boxes = None
 confidences = None
@@ -224,6 +227,7 @@ for trial_idx in range(1, max_detection_trials + 1):
         box_threshold=box_threshold,
         text_threshold=text_threshold,
     )
+    # shape: trial_boxes (N_trial, 4) normalized cxcywh; trial_confidences (N_trial,).
     box_threshold *= 0.85
     text_threshold *= 0.85
     if len(trial_labels) == 0:
@@ -264,9 +268,7 @@ for trial_idx in range(1, max_detection_trials + 1):
             preferred_non_hand_indices = []
             for idx in non_hand_indices:
                 tokens = [
-                    t
-                    for t in re.split(r"[^a-zA-Z0-9_]+", lower_labels[idx])
-                    if t
+                    t for t in re.split(r"[^a-zA-Z0-9_]+", lower_labels[idx]) if t
                 ]
                 if required_label not in tokens:
                     preferred_non_hand_indices.append(idx)
@@ -292,6 +294,7 @@ for trial_idx in range(1, max_detection_trials + 1):
                 )
                 trial_boxes = trial_boxes[keep_indices]
                 trial_confidences = trial_confidences[keep_indices]
+                # shape: trial_boxes (N_keep, 4); trial_confidences (N_keep,).
                 trial_labels = [trial_labels[i] for i in keep_indices]
 
     boxes = trial_boxes
@@ -318,9 +321,10 @@ if boxes is None or confidences is None or labels is None:
 # process the box prompt for SAM 2
 h, w, _ = image_source.shape
 boxes = boxes * torch.Tensor([w, h, w, h])
+# shape: boxes (N, 4) in pixel cxcywh.
 input_boxes: np.ndarray = box_convert(
     boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy"
-).numpy()
+).numpy()  # shape: (N, 4) in pixel xyxy.
 confidences = confidences.numpy().tolist()
 class_names: List[str] = labels
 
@@ -340,7 +344,9 @@ if exclude_mask_info_path and exclude_mask_root:
             mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask_img is None:
                 continue
+            # shape: mask_img (H, W).
             exclude_masks.append(mask_img > 0)
+            # shape: exclude_masks[-1] is (H, W).
     except FileNotFoundError:
         print(f"[warn] exclude_mask_info not found: {exclude_mask_info_path}")
 
@@ -358,11 +364,13 @@ if exclude_masks:
             mask_set, _, _ = image_predictor.predict(
                 box=input_box, multimask_output=False
             )
+            # shape: input_box is (4,); mask_set is (1, 1, H, W) or (1, H, W).
         except RuntimeError as exc:
             print(f"[warn] SAM2 prediction failed for box {input_box}: {exc}")
             keep_indices.append(idx)
             continue
         pred_mask: np.ndarray = mask_set[0] > 0
+        # shape: pred_mask is (H, W), or (1, H, W) for SAM builds that keep channel dim.
         max_iou = 0.0
         for exclude_mask in exclude_masks:
             print(
@@ -373,10 +381,11 @@ if exclude_masks:
                     exclude_mask.astype(np.uint8),
                     (pred_mask.shape[1], pred_mask.shape[0]),
                     interpolation=cv2.INTER_NEAREST,
-                )
+                )  # shape: (H, W), resized to match pred_mask.
                 exclude_bool = resized > 0
             else:
                 exclude_bool = exclude_mask
+            # shape: exclude_bool matches pred_mask.
             max_iou = max(max_iou, compute_mask_iou(pred_mask, exclude_bool))
         if max_iou >= EXCLUDE_MASK_IOU_THRESHOLD:
             print(
@@ -387,6 +396,7 @@ if exclude_masks:
 
     if keep_indices and len(keep_indices) < len(input_boxes):
         input_boxes = input_boxes[keep_indices]
+        # shape: (N_keep, 4) in pixel xyxy.
         confidences = [confidences[i] for i in keep_indices]
         class_names = [class_names[i] for i in keep_indices]
     elif not keep_indices:
@@ -419,9 +429,10 @@ with torch.autocast(
         box=input_boxes,
         multimask_output=False,
     )
+    # shape: masks (N, 1, H, W) or (N, H, W); scores (N, 1); logits (N, 1, H_l, W_l).
 # convert the mask shape to (n, H, W)
 if masks.ndim == 4:
-    masks = masks.squeeze(1)
+    masks = masks.squeeze(1)  # shape: (N, H, W).
 
 """
 Step 3: Register each object's positive points to video predictor with seperate add_new_points call
@@ -441,6 +452,7 @@ if PROMPT_TYPE_FOR_VIDEO == "box":
             obj_id=object_id,
             box=box,
         )
+        # shape: box is (4,); out_mask_logits is (N_obj, 1, H, W).
 else:
     raise NotImplementedError(
         "SAM 2 video predictor only support point/box/mask prompts"
@@ -458,7 +470,7 @@ for (
     video_segments[out_frame_idx] = {
         out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
         for i, out_obj_id in enumerate(out_obj_ids)
-    }
+    }  # shape per object mask: (1, H, W).
 
 """
 Step 5: Visualize the segment results across the video and save them
@@ -476,7 +488,7 @@ with open(f"{output_path}/mask/mask_info_{camera_idx}.json", "w") as f:
 for frame_idx, masks in video_segments.items():
     for obj_id, mask in masks.items():
         existDir(f"{output_path}/mask/{camera_idx}/{obj_id}")
-        # mask is 1 * H * W
+        # shape: mask (1, H, W).
         Image.fromarray((mask[0] * 255).astype(np.uint8)).save(
             f"{output_path}/mask/{camera_idx}/{obj_id}/{frame_idx}.png"
         )

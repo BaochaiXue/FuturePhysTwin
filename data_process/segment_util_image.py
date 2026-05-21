@@ -56,16 +56,18 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """Compute IoU between two boolean masks, resizing *mask_b* if needed."""
 
     mask_a_bool = mask_a.astype(bool)
+    # shape: mask_a_bool is (H, W).
     print(f"[debug info]mask_a shape: {mask_a.shape}, mask_b shape: {mask_b.shape}")
     if mask_a.shape != mask_b.shape:
         mask_b_resized = cv2.resize(
             mask_b.astype(np.uint8),
             (mask_a.shape[1], mask_a.shape[0]),
             interpolation=cv2.INTER_NEAREST,
-        )
+        )  # shape: (H, W), resized to match mask_a.
         mask_b_bool = mask_b_resized.astype(bool)
     else:
         mask_b_bool = mask_b.astype(bool)
+    # shape: mask_b_bool is (H, W).
     intersection = np.logical_and(mask_a_bool, mask_b_bool).sum()
     union = mask_a_bool.sum() + mask_b_bool.sum() - intersection
     if union == 0:
@@ -99,6 +101,7 @@ def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) 
     text = TEXT_PROMPT
 
     image_source, image = load_image(img_path)
+    # shape: image_source (H, W, 3); image is GroundingDINO input (C, H_dino, W_dino).
 
     sam2_predictor.set_image(image_source)
 
@@ -109,13 +112,15 @@ def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) 
         box_threshold=box_threshold,
         text_threshold=text_threshold,
     )
+    # shape: boxes (N, 4) in normalized cxcywh; confidences (N,).
 
     # process the box prompt for SAM 2
     h, w, _ = image_source.shape
     boxes = boxes * torch.Tensor([w, h, w, h])
+    # shape: boxes (N, 4) in pixel cxcywh.
     input_boxes: np.ndarray = box_convert(
         boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy"
-    ).numpy()
+    ).numpy()  # shape: (N, 4) in pixel xyxy.
 
     if isinstance(confidences, torch.Tensor):
         conf_values: list[float] = confidences.detach().cpu().numpy().tolist()
@@ -129,6 +134,7 @@ def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) 
         if exclude_mask is None:
             raise FileNotFoundError(f"Failed to read exclude mask: {EXCLUDE_MASK_PATH}")
         exclude_mask = (exclude_mask > 0).astype(np.uint8) * 255
+        # shape: exclude_mask (H_exclude, W_exclude).
         filtered_boxes = []
         for box in input_boxes:
             # use box to get mask from sam2_predictor
@@ -139,15 +145,18 @@ def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) 
                     box=box[None, :],
                     multimask_output=False,
                 )
+                # shape: box[None, :] is (1, 4); masks is (1, 1, H, W) or (1, H, W).
             if masks.ndim == 4:
-                masks = masks.squeeze(1)
+                masks = masks.squeeze(1)  # shape: (1, H, W).
             mask_img: np.ndarray = (masks[0] * 255).astype(np.uint8)
+            # shape: mask_img (H, W).
             iou = compute_mask_iou(mask_img, exclude_mask)
             print(f"[GroundingDINO Debug] box {box} IoU with exclude mask: {iou}")
             if iou < EXCLUDE_MASK_IOU_THRESHOLD:
                 filtered_boxes.append(box)
         if filtered_boxes:
             input_boxes = np.stack(filtered_boxes, axis=0).astype(np.float32)
+            # shape: (N_keep, 4) in pixel xyxy.
             print(
                 f"[GroundingDINO Debug] {len(input_boxes)} boxes remain after filtering"
             )
@@ -169,17 +178,21 @@ def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) 
             box=input_boxes,
             multimask_output=False,
         )
+        # shape: masks (N, 1, H, W) or (N, H, W); scores (N, 1); logits (N, 1, H_l, W_l).
     if masks.ndim == 4:
-        masks = masks.squeeze(1)
+        masks = masks.squeeze(1)  # shape: (N, H, W).
     print(f"Detected {len(masks)} objects")
 
     raw_img: np.ndarray | None = cv2.imread(img_path)
     if raw_img is None:
         raise FileNotFoundError(f"Failed to read image: {img_path}")
     mask_img: np.ndarray = (masks[0] * 255).astype(np.uint8)
+    # shape: raw_img (H, W, 3); mask_img (H, W).
 
     ref_img = np.zeros((h, w, 4), dtype=np.uint8)
+    # shape: ref_img (H, W, 4), RGBA output.
     mask_bool = mask_img > 0
+    # shape: mask_bool (H, W).
     ref_img[mask_bool, :3] = raw_img[mask_bool]
     ref_img[:, :, 3] = mask_bool.astype(np.uint8) * 255
     cv2.imwrite(output_path, ref_img)

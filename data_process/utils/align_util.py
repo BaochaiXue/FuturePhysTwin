@@ -17,7 +17,9 @@ from scipy.spatial import cKDTree
 
 def select_point(points, raw_matching_points, object_mask):
     mask_coords = np.column_stack(np.where(object_mask > 0))
+    # shape: mask_coords (M, 2) in (y, x) order.
     mask_coords = mask_coords[:, ::-1]
+    # shape: mask_coords (M, 2) in (x, y) order.
     tree = cKDTree(mask_coords)
 
     distances, indices = tree.query(raw_matching_points)
@@ -25,6 +27,7 @@ def select_point(points, raw_matching_points, object_mask):
     new_match = mask_coords[indices]
     # Pay attention to the case that the keypoint is in different order
     matched_points = points[new_match[:, 1], new_match[:, 0]]
+    # shape: new_match (K, 2); matched_points (K, 3).
     return mask_coords[indices], matched_points
 
 
@@ -115,17 +118,22 @@ def project_2d_to_3d(image_points, depth, camera_intrinsics, camera_pose):
     cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
     # Convert image points to normalized device coordinates (NDC)
     ndc_points = np.zeros((image_points.shape[0], 3))
+    # shape: ndc_points (N, 3), camera-space xyz for each input pixel.
     for i, (u, v) in enumerate(image_points):
         z = depth[int(v), int(u)]
         x = -(u - cx) * z / fx
         y = -(v - cy) * z / fy
         ndc_points[i] = [x, y, z]
     valid_mask = ndc_points[:, 2] > 0
+    # shape: valid_mask (N,), true for pixels with valid depth.
     ndc_points = ndc_points[valid_mask]
+    # shape: ndc_points (K, 3), valid camera-space xyz.
     # ndc_points = np.vstack((ndc_points, np.zeros(3), [[0, 0, 0]])) # modified
     # Convert from camera coordinates to world coordinates
     ndc_points_homogeneous = np.hstack((ndc_points, np.ones((ndc_points.shape[0], 1))))
+    # shape: ndc_points_homogeneous (K, 4).
     world_points_homogeneous = ndc_points_homogeneous @ np.linalg.inv(camera_pose)
+    # shape: world_points_homogeneous (K, 4).
     return world_points_homogeneous[:, :3], valid_mask
 
 
@@ -156,20 +164,25 @@ def sample_camera_poses(radius, num_samples, num_up_samples=4, device="cpu"):
                 position = np.array([x, y, z])[None, :]
                 lookat = np.array([0, 0, 0])[None, :]
                 up = up[None, :]
+                # shape: position, lookat, and up are each (1, 3).
                 R, T = look_at_view_transform(radius, t, p, False, position, lookat, up)
                 camera_pose = np.eye(4)
+                # shape: camera_pose (4, 4), row-vector world-to-view transform.
                 camera_pose[:3, :3] = R
                 camera_pose[3, :3] = T
                 camera_poses.append(camera_pose)
 
     print("total poses", len(camera_poses))
+    # shape: (P, 4, 4), where P == len(camera_poses).
     return torch.tensor(np.array(camera_poses), device=device)
 
 
 def render_image(mesh, camera_poses, width=640, height=480, fov=1, device="cpu"):
     camera_poses = torch.tensor(camera_poses, device=device)
+    # shape: camera_poses (4, 4) or (P, 4, 4).
     if len(camera_poses.shape) == 2:
         camera_poses = camera_poses[None, :]
+        # shape: camera_poses (1, 4, 4).
 
     from pytorch3d.io import IO
     from pytorch3d.io.experimental_gltf_io import MeshGlbFormat
@@ -181,6 +194,7 @@ def render_image(mesh, camera_poses, width=640, height=480, fov=1, device="cpu")
 
     R = camera_poses[:, :3, :3]
     T = camera_poses[:, 3, :3]
+    # shape: R (P, 3, 3); T (P, 3).
     num_poses = camera_poses.shape[0]
     cameras = PerspectiveCameras(
         R=R,
@@ -190,10 +204,12 @@ def render_image(mesh, camera_poses, width=640, height=480, fov=1, device="cpu")
         * 0.5
         * width
         / np.tan(fov / 2),  # Calculate focal length from FOV in radians
+        # shape: focal_length (P, 1).
         principal_point=torch.tensor((width / 2, height / 2))
         .repeat(num_poses)
-        .reshape(-1, 2),  # different order from image_size!!
+        .reshape(-1, 2),  # shape: (P, 2), different order from image_size!!
         image_size=torch.tensor((height, width)).repeat(num_poses).reshape(-1, 2),
+        # shape: image_size (P, 2).
         in_ndc=False,
     )
 
@@ -219,8 +235,10 @@ def render_image(mesh, camera_poses, width=640, height=480, fov=1, device="cpu")
     extended_mesh = mesh.extend(num_poses).to(device)
     fragments = renderer.rasterizer(extended_mesh)
     depth = fragments.zbuf.squeeze().cpu().numpy()
+    # shape: zbuf (P, H, W, 1) -> depth (P, H, W), or (H, W) when P == 1.
     rendered_images = renderer(mesh.extend(num_poses))
     color = (rendered_images[..., :3].cpu().numpy() * 255).astype(np.uint8)
+    # shape: color (P, H, W, 3).
 
     return color, depth
 
@@ -243,6 +261,7 @@ def render_multi_images(
     fy = fx  # * aspect_ratio
     cx, cy = width / 2, height / 2
     camera_intrinsics = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+    # shape: camera_intrinsics (3, 3).
 
     num_cameras = camera_poses.shape[0]
 
@@ -256,4 +275,5 @@ def render_multi_images(
     )
     color = np.concatenate([color1, color2], axis=0)
     depth = np.concatenate([depth1, depth2], axis=0)
+    # shape: color (P, H, W, 3); depth (P, H, W).
     return color, depth, camera_poses, camera_intrinsics

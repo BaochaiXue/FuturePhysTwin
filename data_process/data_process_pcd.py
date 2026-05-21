@@ -87,6 +87,7 @@ def getCamera(
     # Add origin and four corner points in image plane
     points = []
     camera_origin = np.array([0, 0, 0, 1])
+    # shape: camera_origin (4,), homogeneous camera origin.
     points.append(np.dot(transformation, camera_origin)[0:3])
     # Calculate the four points for of the image plane
     magnitude = (cy**2 + cx**2 + fx**2) ** 0.5
@@ -97,6 +98,7 @@ def getCamera(
     for point in plane_points:
         point = list(np.array(point) / magnitude * scale)
         temp_point = np.array(point + [1])
+        # shape: temp_point (4,), homogeneous image-plane corner.
         points.append(np.dot(transformation, temp_point)[0:3])
     # Draw the camera framework
     lines = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 4], [1, 3], [3, 4]]
@@ -111,6 +113,7 @@ def getCamera(
         shoot_points = []
         shoot_points.append(np.dot(transformation, camera_origin)[0:3])
         shoot_points.append(np.dot(transformation, np.array([0, 0, -length, 1]))[0:3])
+        # shape: shoot_points becomes two (3,) endpoints.
         shoot_lines = [[0, 1]]
         shoot_line_set = o3d.geometry.LineSet(
             points=o3d.utility.Vector3dVector(shoot_points),
@@ -125,13 +128,18 @@ def getCamera(
 def getPcdFromDepth(depth, intrinsic):
     H, W = depth.shape
     x, y = np.meshgrid(np.arange(W), np.arange(H))
+    # shape: x and y are (H, W) pixel-coordinate grids.
     x = x.reshape(-1)
     y = y.reshape(-1)
     depth = depth.reshape(-1)
+    # shape: x, y, and depth are (H*W,).
     points = np.stack([x, y, np.ones_like(x)], axis=1)
+    # shape: points (H*W, 3), homogeneous pixel rays.
     points = points * depth[:, None]
+    # shape: points (H*W, 3), depth-scaled camera rays.
     points = points @ np.linalg.inv(intrinsic).T
     points = points.reshape(H, W, 3)
+    # shape: points (H, W, 3), camera-space xyz per pixel.
     return points
 
 
@@ -141,25 +149,34 @@ def get_pcd_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
     total_masks = []
     for i in range(num_cam):
         color = iio.imread(f"{path}/color/{i}/{frame_idx}.png")
+        # shape: color (H, W, C) or grayscale (H, W).
         if color.ndim == 2:
             color = np.repeat(color[..., None], 3, axis=2)
+            # shape: color (H, W, 3).
         if color.shape[-1] == 4:
             color = color[:, :, :3]
+            # shape: color (H, W, 3).
         color = color.astype(np.float32) / 255.0
         depth = np.load(f"{path}/depth/{i}/{frame_idx}.npy") / 1000.0
+        # shape: depth (H, W), meters.
 
         points = getPcdFromDepth(
             depth,
             intrinsic=intrinsics[i],
         )
         masks = np.logical_and(points[:, :, 2] > 0.2, points[:, :, 2] < 5.5)
+        # shape: points (H, W, 3); masks (H, W).
         points_flat = points.reshape(-1, 3)
+        # shape: points_flat (H*W, 3).
         # Transform points to world coordinates using homogeneous transformation
         homogeneous_points = np.hstack(
             (points_flat, np.ones((points_flat.shape[0], 1)))
         )
+        # shape: homogeneous_points (H*W, 4).
         points_world = np.dot(c2ws[i], homogeneous_points.T).T[:, :3]
+        # shape: points_world (H*W, 3).
         points_final = points_world.reshape(points.shape)
+        # shape: points_final (H, W, 3), world-space xyz per pixel.
         total_points.append(points_final)
         total_colors.append(color)
         total_masks.append(masks)
@@ -190,6 +207,7 @@ def get_pcd_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
     total_points = np.asarray(total_points)
     total_colors = np.asarray(total_colors)
     total_masks = np.asarray(total_masks)
+    # shape: total_points (Cams, H, W, 3); total_colors (Cams, H, W, 3); total_masks (Cams, H, W).
     return total_points, total_colors, total_masks
 
 
@@ -203,29 +221,40 @@ def get_raw_points_from_data(path, frame_idx, num_cam, intrinsics, c2ws):
     raw_colors_per_cam = []
     for i in range(num_cam):
         color = iio.imread(f"{path}/color/{i}/{frame_idx}.png")
+        # shape: color (H, W, C) or grayscale (H, W).
         if color.ndim == 2:
             color = np.repeat(color[..., None], 3, axis=2)
+            # shape: color (H, W, 3).
         if color.shape[-1] == 4:
             color = color[:, :, :3]
+            # shape: color (H, W, 3).
         color = color.astype(np.float32) / 255.0
         depth = np.load(f"{path}/depth/{i}/{frame_idx}.npy") / 1000.0
+        # shape: depth (H, W), meters.
 
         points = getPcdFromDepth(depth, intrinsic=intrinsics[i])
         valid_raw_mask = np.logical_and(np.isfinite(depth), depth > 0.0)
+        # shape: points (H, W, 3); valid_raw_mask (H, W).
         points_flat = points.reshape(-1, 3)
+        # shape: points_flat (H*W, 3).
         homogeneous_points = np.hstack(
             (points_flat, np.ones((points_flat.shape[0], 1)))
         )
+        # shape: homogeneous_points (H*W, 4).
         points_world = np.dot(c2ws[i], homogeneous_points.T).T[:, :3]
+        # shape: points_world (H*W, 3).
         points_world = points_world.reshape(points.shape)
+        # shape: points_world (H, W, 3).
 
         raw_points = points_world[valid_raw_mask].reshape(-1, 3)
         raw_colors = color[valid_raw_mask].reshape(-1, 3)
+        # shape: raw_points (N_i, 3); raw_colors (N_i, 3).
         raw_points_per_cam.append(raw_points)
         raw_colors_per_cam.append(raw_colors)
 
     raw_points_merged = np.concatenate(raw_points_per_cam, axis=0)
     raw_colors_merged = np.concatenate(raw_colors_per_cam, axis=0)
+    # shape: raw_points_merged (sum_i N_i, 3); raw_colors_merged (sum_i N_i, 3).
     return raw_points_per_cam, raw_colors_per_cam, raw_points_merged, raw_colors_merged
 
 
@@ -238,21 +267,26 @@ def set_view(view_control, lookat, front, up, zoom):
 
 def get_focus_points(points, colors, focus_quantile):
     if points.shape[0] == 0:
+        # shape: fallback center (3,).
         return points, colors, np.zeros((3,), dtype=np.float32)
     center = np.median(points, axis=0)
+    # shape: center (3,).
     q = float(np.clip(focus_quantile, 0.05, 1.0))
     if q >= 1.0:
         return points, colors, center
 
     dist = np.linalg.norm(points - center[None, :], axis=1)
+    # shape: dist (N,).
     radius = np.quantile(dist, q)
     keep = dist <= radius
+    # shape: keep (N,).
     if keep.sum() < 2000:
         # Avoid over-clipping on sparse frames.
         keep = dist <= np.quantile(dist, 0.95)
     focus_points = points[keep]
     focus_colors = colors[keep]
     focus_center = np.median(focus_points, axis=0)
+    # shape: focus_points (K, 3); focus_colors (K, 3); focus_center (3,).
     return focus_points, focus_colors, focus_center
 
 
@@ -263,6 +297,7 @@ def draw_view_labels(frame_concat, frame_idx, panel_labels):
     panel_width = frame_concat.shape[1] // len(panel_labels)
     for panel_idx, label in enumerate(panel_labels):
         draw.text((panel_width * panel_idx + 12, 34), label, fill=(255, 255, 255))
+    # shape: returned frame is (H, W_total, 3).
     return np.asarray(image)
 
 
@@ -270,11 +305,13 @@ if __name__ == "__main__":
     with open(f"{base_path}/{case_name}/metadata.json", "r") as f:
         data = json.load(f)
     intrinsics = np.array(data["intrinsics"])
+    # shape: intrinsics (Cams, 3, 3).
     frame_num = data["frame_num"]
     print(data["serial_numbers"])
 
     num_cam = len(intrinsics)
     c2ws = pickle.load(open(f"{base_path}/{case_name}/calibrate.pkl", "rb"))
+    # shape: c2ws list/array of camera-to-world transforms, each (4, 4).
 
     exist_dir(f"{base_path}/{case_name}/pcd")
     debug_dir = f"{base_path}/{case_name}/pcd_debug"
@@ -289,6 +326,7 @@ if __name__ == "__main__":
     )
     render_option = vis.get_render_option()
     render_option.background_color = np.array([0.05, 0.05, 0.05])
+    # shape: background_color (3,).
     render_option.point_size = 4.0
 
     video_path = f"{debug_dir}/pcd.mp4"
@@ -309,6 +347,7 @@ if __name__ == "__main__":
         points, colors, masks = get_pcd_from_data(
             f"{base_path}/{case_name}", i, num_cam, intrinsics, c2ws
         )
+        # shape: points/colors (Cams, H, W, 3); masks (Cams, H, W).
         (
             raw_points_per_cam,
             raw_colors_per_cam,
@@ -317,6 +356,7 @@ if __name__ == "__main__":
         ) = get_raw_points_from_data(
             f"{base_path}/{case_name}", i, num_cam, intrinsics, c2ws
         )
+        # shape: raw_points_merged/raw_colors_merged (sum_cam N_cam, 3); per-camera lists contain (N_cam, 3).
 
         if i == 0:
             pcd = o3d.geometry.PointCloud()
@@ -364,6 +404,7 @@ if __name__ == "__main__":
                 vis.poll_events()
                 vis.update_renderer()
                 frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                # shape: frame (H_debug, W_debug, 3), float RGB.
                 frames.append((frame * 255).astype(np.uint8))
         else:
             for cam_idx in range(num_cam):
@@ -389,8 +430,10 @@ if __name__ == "__main__":
                 vis.poll_events()
                 vis.update_renderer()
                 frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+                # shape: frame (H_debug, W_debug, 3), float RGB.
                 frames.append((frame * 255).astype(np.uint8))
         frame_concat = np.concatenate(frames, axis=1)
+        # shape: frame_concat (H_debug, views*W_debug, 3).
         frame_concat = draw_view_labels(frame_concat, i, panel_labels)
         if i == 0:
             iio.imwrite(f"{debug_dir}/frame0_raw_3view.png", frame_concat)
@@ -402,6 +445,7 @@ if __name__ == "__main__":
             colors=colors,
             masks=masks,
         )
+        # saved shapes: points/colors (Cams, H, W, 3); masks (Cams, H, W).
 
     video_writer.close()
     vis.destroy_window()

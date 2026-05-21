@@ -29,6 +29,7 @@ pipeline.cuda()
 
 final_im = Image.open(img_path).convert("RGBA")
 assert not np.all(np.array(final_im)[:, :, 3] == 255)
+# shape: np.array(final_im) is (H, W, 4), RGBA.
 
 # Run the pipeline
 outputs = pipeline.run(
@@ -37,10 +38,12 @@ outputs = pipeline.run(
 
 video_gs = render_utils.render_video(outputs["gaussian"][0])["color"]
 video_mesh = render_utils.render_video(outputs["mesh"][0])["normal"]
+# shape: video_gs/video_mesh are frame sequences with frames shaped (H, W, 3).
 video = [
     np.concatenate([frame_gs, frame_mesh], axis=1)
     for frame_gs, frame_mesh in zip(video_gs, video_mesh)
 ]
+# shape: each concatenated frame is (H, 2*W, 3).
 imageio.mimsave(f"{output_dir}/visualization.mp4", video, fps=30)
 
 # GLB files can be extracted from the outputs

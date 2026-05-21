@@ -32,7 +32,9 @@ pipeline = pipeline.to("cuda")
 low_res_img = Image.open(img_path).convert("RGB")
 if mask_path is not None:
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    # shape: mask (H, W).
     bbox = np.argwhere(mask > 0.8 * 255)
+    # shape: bbox (N_mask, 2), rows are (y, x) foreground pixels.
     bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
     center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
     size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
