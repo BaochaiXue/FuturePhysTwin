@@ -11,6 +11,7 @@ from pytorch3d.renderer import (
     MeshRenderer,
     MeshRasterizer,
     SoftPhongShader,
+    TexturesVertex,
 )
 from scipy.spatial import cKDTree
 
@@ -177,6 +178,12 @@ def render_image(mesh, camera_poses, width=640, height=480, fov=1, device="cpu")
     io = IO()
     io.register_meshes_format(MeshGlbFormat())
     mesh = io.load_mesh(mesh)
+    if isinstance(mesh.textures, TexturesVertex):
+        verts_features = mesh.textures.verts_features_list()
+        if any(features.shape[-1] > 3 for features in verts_features):
+            mesh.textures = TexturesVertex(
+                verts_features=[features[..., :3] for features in verts_features]
+            )
     mesh = mesh.to(device)
 
     R = camera_poses[:, :3, :3]

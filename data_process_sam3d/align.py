@@ -585,10 +585,14 @@ if __name__ == "__main__":
         vis.create_window(visible=False)
         dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
         height, width, _ = dummy_frame.shape
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         video_writer = cv2.VideoWriter(
             f"{output_dir}/final_matching.mp4", fourcc, 30, (width, height)
         )
+        if not video_writer.isOpened():
+            raise RuntimeError(
+                f"Failed to open VideoWriter for {output_dir}/final_matching.mp4"
+            )
         # final_mesh_world.compute_vertex_normals()
         # final_mesh_world.translate([0, 0, 0.2])
         # mesh_wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(final_mesh_world)
@@ -606,6 +610,7 @@ if __name__ == "__main__":
             frame = (frame * 255).astype(np.uint8)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             video_writer.write(frame)
+        video_writer.release()
         vis.destroy_window()
 
     mesh.vertices = np.asarray(final_mesh_world.vertices)[trimesh_indices]

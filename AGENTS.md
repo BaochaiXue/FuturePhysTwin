@@ -42,3 +42,15 @@ Before finishing, attach verification evidence using the QA report template.
 Treat PhysTwin edits here as upstream-facing or data/reconstruction-facing work.
 Do not mix Newton-bridge conclusions into PhysTwin files unless the coupling is
 explicitly the topic.
+
+## Package Installation Bias
+
+When an environment install hits "no matching distribution" or an upstream
+version gate:
+
+1. Try the latest compatible upstream package first.
+2. If the latest package has Python/Torch/CUDA/API incompatibilities, patch the
+   source locally and rebuild.
+3. Prefer a complete working package over a placeholder or narrow shim. Use a
+   shim only as a temporary diagnostic step, and replace it with the full
+   package before treating the environment as complete.

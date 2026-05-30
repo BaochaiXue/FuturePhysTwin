@@ -222,6 +222,78 @@ python export_gaussian_data.py
 python export_video_human_mask.py
 ```
 
+#### SAM3D / MV-SAM3D shape prior backend
+
+The SAM3D data path is driven by `script_process_data_sam3d.py` and
+`process_data_sam3d.py`. When a `data_config.csv` row has shape prior enabled,
+the default backend is now MV-SAM3D:
+
+```bash
+export MVSAM3D_ROOT=/path/to/MV-SAM3D
+
+python process_data_sam3d.py \
+  --base_path ./data/different_types \
+  --case_name <case> \
+  --category <category> \
+  --shape_prior \
+  --shape_prior_backend mvsam3d \
+  --mvsam3d_input_preprocess_backend legacy_upscale \
+  --mvsam3d_run_da3 \
+  --mvsam3d_da3_model_path /path/to/DA3/snapshot-or-checkout \
+  --mvsam3d_max_faces 50000 \
+  --align_backend auto \
+  --shape_prior_sampling_backend auto
+```
+
+MV-SAM3D, Depth Anything 3, checkpoints, Hugging Face tokens, caches, and
+generated shape assets must live outside this repository. Run the command from
+the environment that contains the full PhysTwin and MV-SAM3D runtime; on the
+validated local machine this is `phystwin-max`. Subprocesses default to that
+same Python executable, while `--mvsam3d_python`, `--mvsam3d_preprocess_python`,
+`--pipeline_python`, and `--legacy_shape_prior_python` remain available for
+non-standard setups.
+
+If DA3 weights are stored in a Hugging Face snapshot cache rather than at the
+model root, pass the snapshot directory with `--mvsam3d_da3_model_path`; it is
+forwarded directly to MV-SAM3D's `scripts/run_da3.py --model_path`.
+
+The expected case format for the adapter is:
+
+```text
+data/different_types/<case>/
+├── color/<cam_idx>/0.png
+└── mask/
+    ├── mask_info_<cam_idx>.json
+    └── <cam_idx>/<obj_idx>/0.png
+```
+
+By default, the MV-SAM3D backend mirrors the legacy single-view preprocessing
+for every selected view: it runs `image_upscale.py` on the masked object crop,
+then runs `segment_util_image.py` on the upscaled image to produce the high-res
+RGBA object mask. Use `--mvsam3d_input_preprocess_backend raw` to bypass this
+and copy the original frame-0 RGB/masks directly. DA3 outputs are stored under
+`shape/mvsam3d/da3/<preprocess-backend>/` so raw and high-resolution inputs do
+not share stale features.
+
+The adapter writes MV-SAM3D inputs under
+`<case>/shape/mvsam3d/input/images/` and
+`<case>/shape/mvsam3d/input/<category-as-mask-prompt>/`, with RGBA masks whose
+alpha channel is foreground. MV-SAM3D results are normalized back to the
+existing downstream contract: `shape/object.glb`, optional `shape/object.ply`,
+and optional `shape/visualization.mp4`. The full MV-SAM3D `result.glb` remains
+under `shape/mvsam3d/outputs/`; `shape/object.glb` is simplified to
+`--mvsam3d_max_faces` by default so `align.py` keeps the same single-object mesh
+contract without rendering an unnecessarily dense debug mesh. Use
+`--mvsam3d_max_faces 0` to keep the full mesh. The legacy single-view SAM3D
+backend is still available with `--shape_prior_backend sam3d`.
+
+When `--align_backend auto` is used, MV-SAM3D cases run the multi-view aligner
+`data_process_sam3d/align_mvsam3d.py`. It uses all frame-0 manifest views for
+matching, scoring, and diagnostics, writes compatible outputs back to
+`shape/matching/`, and records metrics under `shape/mvsam3d/align/metrics.json`.
+The final sampling stage also defaults to the MV-SAM3D sampler for MV cases so
+`final_pcd.mp4` receives denser surface/interior shape-prior points.
+
 ### Control Force Visualization
 Visualize the force applied by the hand to the object as inferred from our PhysTwin model, based solely on video data.
 ```

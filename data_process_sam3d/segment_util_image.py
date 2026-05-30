@@ -21,6 +21,7 @@ import traceback
 import cv2
 import numpy as np
 import torch
+from transformers import BertModel
 from groundingdino.util.inference import load_model, load_image, predict
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -52,6 +53,43 @@ logging.basicConfig(
 )
 
 
+def install_bert_head_mask_compat() -> None:
+    if hasattr(BertModel, "get_head_mask"):
+        has_head_mask = True
+    else:
+        has_head_mask = False
+
+    if not has_head_mask:
+        def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+            if head_mask is None:
+                return [None] * num_hidden_layers
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+            dtype = next(self.parameters()).dtype
+            return head_mask.to(dtype=dtype)
+
+        BertModel.get_head_mask = get_head_mask
+
+    if getattr(BertModel, "_fpt_extended_attention_mask_compat", False):
+        return
+
+    original_get_extended_attention_mask = BertModel.get_extended_attention_mask
+    def get_extended_attention_mask(self, attention_mask, input_shape, dtype=None):
+        if isinstance(dtype, torch.device):
+            dtype = next(self.parameters()).dtype
+        return original_get_extended_attention_mask(
+            self, attention_mask, input_shape, dtype=dtype
+        )
+
+    BertModel.get_extended_attention_mask = get_extended_attention_mask
+    BertModel._fpt_extended_attention_mask_compat = True
+
+
 def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """Compute IoU between two boolean masks, resizing *mask_b* if needed."""
 
@@ -74,6 +112,8 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
 
 
 def run_segmentation(box_threshold: float = 0.35, text_threshold: float = 0.25) -> None:
+    install_bert_head_mask_compat()
+
     SAM2_CHECKPOINT = "./data_process/groundedSAM_checkpoints/sam2.1_hiera_large.pt"
     SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
     GROUNDING_DINO_CONFIG = (
