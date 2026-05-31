@@ -6,9 +6,17 @@
 
 ## Current State
 
-The default SAM3D data-processing shape-prior backend now points at an
-MV-SAM3D wrapper. The legacy single-view SAM3D backend remains available with
-`--shape_prior_backend sam3d`.
+2026-05-30 route split update: the production data-process route is now
+single-view by default. Use `process_data_single_view.py
+--single_view_backend sam3d` for the ordinary SAM3D path and
+`--single_view_backend trellis` for the Trellis baseline. MV-SAM3D is an
+explicit experimental route through `process_data_mvsam3d.py`. The old
+`process_data_sam3d.py` and `script_process_data_sam3d.py` entrypoints are now
+compatibility shims and default to the single-view SAM3D route.
+
+Historical note: earlier work in this plan made MV-SAM3D the default backend.
+That decision has been superseded because visual checks showed ordinary SAM3D
+was usually cleaner for the tested cases.
 
 The new adapter builds `shape/mvsam3d/input/images/<view>.png` and
 `shape/mvsam3d/input/<mask_prompt>/<view>.png` RGBA masks from frame-0 case
@@ -81,6 +89,11 @@ remain for non-standard setups only.
 - `data_process_sam3d/prepare_mvsam3d_scene.py`
 - `data_process_sam3d/shape_prior_mvsam3d.py`
 - `data_process_sam3d/align_mvsam3d.py`
+- `process_data_routes.py`
+- `process_data_single_view.py`
+- `process_data_mvsam3d.py`
+- `script_process_data_single_view.py`
+- `script_process_data_mvsam3d.py`
 - `process_data_sam3d.py`
 - `script_process_data_sam3d.py`
 - `data_process_sam3d/utils/align_util.py`
@@ -97,6 +110,9 @@ remain for non-standard setups only.
 - Command:
   `python -m py_compile process_data_sam3d.py script_process_data_sam3d.py data_process_sam3d/prepare_mvsam3d_scene.py data_process_sam3d/shape_prior_mvsam3d.py`
   Result: passed.
+- Command:
+  `python -m py_compile process_data_routes.py process_data_single_view.py process_data_mvsam3d.py script_process_data_single_view.py script_process_data_mvsam3d.py process_data_sam3d.py script_process_data_sam3d.py`
+  Result: passed for the 2026-05-30 route split.
 - Command: `python scripts/check_harness_docs.py`
   Result: passed, `harness-docs: ok`.
 - Command: help checks for all changed CLIs.
@@ -206,6 +222,50 @@ remain for non-standard setups only.
 - The DA3 wrapper now supports `--da3_model_path`, with
   `--mvsam3d_da3_model_path` pass-through, for Hugging Face snapshot cache
   layouts.
+- A later MV align-quality fix changed `align_mvsam3d.py` to select a
+  gate-aware `sim3_only` result when ARAP/ray-ARAP would overgrow the mesh. On
+  `single_lift_sloth`, the forced rematch run now passes with
+  `vertex_to_obs p95=0.03042 m` and `obs_to_vertex p95=0.01394 m`.
+- Corrected clean rerun evidence lives under
+  `/tmp/fpt-single_lift_sloth-rerun-20260530-000420`. This run used fresh
+  Trellis and MV-SAM3D case copies from the same observations, not
+  `original_shape_backup` or any ambiguous backup path. MV align acceptance was
+  observation-only: `valid_views=2`, `total_inliers=38`,
+  `best_initial_view=2`, `selected_scale_multiplier=0.95`,
+  `vertex_to_obs p95=0.03171 m`, `obs_to_vertex p95=0.01450 m`, and
+  `quality_gates.passed=true`.
+- The corrected scoreboard is
+  `/tmp/fpt-single_lift_sloth-rerun-20260530-000420/scoreboard.json`.
+  Presentation videos are
+  `/tmp/fpt-single_lift_sloth-rerun-20260530-000420/artifacts/LEFT_TRELLIS_RIGHT_MVSAM3D_final_pcd.mp4`
+  and
+  `/tmp/fpt-single_lift_sloth-rerun-20260530-000420/artifacts/LEFT_TRELLIS_RIGHT_MVSAM3D_raw_mesh.mp4`.
+  The scoreboard reports `mv_beats_trellis.passed=true`, but this is only the
+  final end-to-end baseline comparison; it is not used as MV align evidence.
+- MV-SAM3D final sampling now caps its effective shape-prior distance filter at
+  `0.035 m`; the verified rerun kept `surface_points (700, 3)` and
+  `interior_points (1000, 3)`.
+- A second isolated clean rerun after the artifact-mix concern lives under
+  `/tmp/fpt-single_lift_sloth-clean-rerun-20260530-011819`. It has separate
+  backend case copies at `trellis_case/single_lift_sloth` and
+  `mvsam3d_case/single_lift_sloth`, plus copied labeled artifacts under
+  `artifacts/`. The key presentation videos are
+  `/tmp/fpt-single_lift_sloth-clean-rerun-20260530-011819/artifacts/LEFT_TRELLIS_RIGHT_MVSAM3D_final_pcd.mp4`
+  and
+  `/tmp/fpt-single_lift_sloth-clean-rerun-20260530-011819/artifacts/LEFT_TRELLIS_RIGHT_MVSAM3D_raw_mesh.mp4`.
+  MV align remained observation-only and passed with `valid_views=2`,
+  `total_inliers=43`, `selected_stage=sim3_only`, `vertex_to_obs p95=0.03060 m`,
+  and `obs_to_vertex p95=0.01202 m`. The scoreboard reports MV final
+  pcd-to-observation p95 `0.00325 m` versus Trellis `0.01158 m`.
+- Ordinary single-view SAM3D was also rerun in isolation under
+  `/tmp/fpt-single_lift_sloth-sam3d-rerun-20260530-021056`. Artifacts are under
+  `artifacts/` with `SAM3D_` prefixes. The most useful viewing files are
+  `SAM3D_final_pcd_labeled.mp4`, `SAM3D_raw_mesh_labeled.mp4`,
+  `LEFT_SAM3D_RIGHT_MVSAM3D_final_pcd.mp4`, and
+  `LEFT_SAM3D_RIGHT_MVSAM3D_raw_mesh.mp4`. The SAM3D baseline produced
+  `surface_points (570, 3)`, `interior_points (990, 3)`,
+  final-to-observation p95 `0.02137 m`, observation-to-final p95 `0.00415 m`,
+  and prior far fraction `0.05321` beyond `35 mm`.
 - The batch wrapper now follows the safer `script_process_data.py` style:
   `case_filter`, checked subprocess calls, and list-based commands. This also
   fixes unquoted categories such as `stuffed animal`.
@@ -216,3 +276,25 @@ remain for non-standard setups only.
   `data/different_types/single_lift_sloth/`,
   `data_process_sam3d/models/weights/`, and external checkouts under
   `/home/xinjie/external/`.
+- Route split implementation added `process_data_single_view.py` and
+  `process_data_mvsam3d.py`, plus matching batch scripts. Ordinary SAM3D and
+  Trellis should be compared through the single-view route because it follows
+  `data_process` preprocessing, legacy align, and legacy final sampling.
+  MV-SAM3D should be compared through the explicit MV route only.
+- Compatibility shims still accept old `process_data_sam3d.py` commands, but
+  they reject incompatible requests such as single-view SAM3D with
+  `--align_backend mvsam3d`.
+- A fresh functional check of the single-view SAM3D route passed under
+  `/tmp/fpt-single-view-sam3d-route-check-20260530-172406`. Its route manifest
+  records `route=single_view`, `backend=sam3d`, and the expected stage order:
+  `data_process` video segmentation/upscale/image segmentation, SAM3D shape
+  prior, `data_process` dense tracking/pcd/mask/track, legacy align, and legacy
+  final sampling. Outputs include loadable `shape/object.glb`, loadable
+  `shape/matching/final_mesh.glb`, `final_data.pkl`, `final_pcd.mp4`, and
+  `final_data.mp4`.
+- The rerun required compatibility fixes now present in the tree: segmentation
+  subprocesses use `sys.executable` and checked subprocess calls, video
+  segmentation has the BERT `get_head_mask` compatibility shim, single-object
+  cases tolerate one controller detection, SAM3D root/config resolution can use
+  `/home/xinjie/external/MV-SAM3D`, and legacy align warns/falls back when
+  Open3D ARAP factorization fails instead of aborting the pipeline.

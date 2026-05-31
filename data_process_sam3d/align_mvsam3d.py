@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -39,6 +40,10 @@ from utils.align_util import (  # noqa: E402
 MIN_VIEW_INLIERS = 12
 MIN_TOTAL_INLIERS = 36
 DEFAULT_VIEW_INDICES = ["0", "1", "2"]
+DEFAULT_VERTEX_TO_OBS_GATE = 0.035
+DEFAULT_OBS_TO_VERTEX_GATE = 0.015
+SIM3_SCALE_MULTIPLIERS = (0.85, 0.90, 0.95, 1.00, 1.05)
+QUALITY_TOLERANCE = 1e-4
 
 
 @dataclass
@@ -97,6 +102,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth_weight", type=float, default=0.2)
     parser.add_argument("--silhouette_weight", type=float, default=1.0)
     parser.add_argument("--pcd_weight", type=float, default=0.5)
+    parser.add_argument("--vertex_to_obs_gate", type=float, default=DEFAULT_VERTEX_TO_OBS_GATE)
+    parser.add_argument("--obs_to_vertex_gate", type=float, default=DEFAULT_OBS_TO_VERTEX_GATE)
+    parser.add_argument("--prune_far_dist", type=float, default=DEFAULT_VERTEX_TO_OBS_GATE)
+    parser.add_argument("--disable_ray_arap", action="store_true")
     return parser
 
 
@@ -320,6 +329,129 @@ def params_to_matrix(params: np.ndarray) -> np.ndarray:
     return matrix
 
 
+def scaled_sim3_matrix(matrix: np.ndarray, scale_multiplier: float) -> np.ndarray:
+    scaled = matrix.copy()
+    scaled[:3, :3] *= scale_multiplier
+    return scaled
+
+
+def solve_view_match_candidate(
+    view: ViewData,
+    match_result: dict[str, np.ndarray],
+    candidate_idx: int,
+    color: np.ndarray,
+    depth: np.ndarray,
+    camera_pose: np.ndarray,
+    render_intrinsic: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[ViewMatch | None, dict[str, Any]]:
+    valid_matches = match_result["matches"] > -1
+    match_count = int(np.sum(valid_matches))
+    record: dict[str, Any] = {
+        "candidate_idx": int(candidate_idx),
+        "match_count": match_count,
+        "status": "started",
+    }
+    if match_count < MIN_VIEW_INLIERS:
+        record["status"] = "too_few_2d_matches"
+        return None, record
+
+    render_points = match_result["keypoints0"][valid_matches]
+    mesh_points, valid_depth = project_2d_to_3d(
+        render_points, depth, render_intrinsic, camera_pose
+    )
+    raw_pixels_box = match_result["keypoints1"][match_result["matches"][valid_matches]]
+    raw_pixels_box = raw_pixels_box[valid_depth]
+    raw_pixels = raw_pixels_box + np.array([bbox[0], bbox[1]])
+    record["depth_valid_points"] = int(mesh_points.shape[0])
+    if mesh_points.shape[0] < MIN_VIEW_INLIERS:
+        record["status"] = "too_few_depth_valid_matches"
+        return None, record
+
+    target_pixels, target_world = select_point(view.points, raw_pixels, view.object_mask)
+    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+        np.float32(mesh_points),
+        np.float32(raw_pixels),
+        np.float32(view.intrinsic),
+        distCoeffs=np.zeros(4, dtype=np.float32),
+        flags=cv2.SOLVEPNP_EPNP,
+        iterationsCount=400,
+        reprojectionError=20.0,
+        confidence=0.995,
+    )
+    inlier_count = 0 if inliers is None else int(len(inliers))
+    record["pnp_success"] = bool(success)
+    record["pnp_inliers"] = inlier_count
+    if not success or inliers is None or inlier_count < MIN_VIEW_INLIERS:
+        record["status"] = "too_few_pnp_inliers"
+        return None, record
+
+    inlier_ids = inliers.reshape(-1)
+    cv2.solvePnP(
+        np.float32(mesh_points[inlier_ids]),
+        np.float32(raw_pixels[inlier_ids]),
+        np.float32(view.intrinsic),
+        np.zeros(4, dtype=np.float32),
+        rvec,
+        tvec,
+        useExtrinsicGuess=True,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    projected, _ = cv2.projectPoints(
+        np.float32(mesh_points[inlier_ids]),
+        rvec,
+        tvec,
+        view.intrinsic,
+        np.zeros(4, dtype=np.float32),
+    )
+    reprojection_error = float(
+        np.linalg.norm(raw_pixels[inlier_ids] - projected.reshape(-1, 2), axis=1).mean()
+    )
+
+    rotation, _ = cv2.Rodrigues(rvec)
+    mesh2camera = np.eye(4, dtype=np.float64)
+    mesh2camera[:3, :3] = rotation
+    mesh2camera[:3, 3] = tvec.reshape(-1)
+
+    mesh_cam = transform_points(mesh2camera, mesh_points[inlier_ids])
+    target_cam = transform_points(view.w2c, target_world[inlier_ids])
+    scale = solve_scale(mesh_cam, target_cam)
+    scale_matrix = np.eye(4, dtype=np.float64) * scale
+    scale_matrix[3, 3] = 1.0
+    mesh2world = view.c2w @ scale_matrix @ mesh2camera
+
+    record.update(
+        {
+            "status": "accepted",
+            "reprojection_error": reprojection_error,
+            "scale": float(scale),
+        }
+    )
+    return (
+        ViewMatch(
+            view=view.view,
+            view_index=view.index,
+            best_color=color,
+            best_depth=depth,
+            best_pose=camera_pose,
+            render_intrinsic=render_intrinsic,
+            match_result=match_result,
+            bbox=bbox,
+            mesh_points=mesh_points,
+            raw_pixels=raw_pixels,
+            target_pixels=target_pixels,
+            target_world=target_world,
+            inliers=inlier_ids,
+            mesh2camera=mesh2camera,
+            scale=scale,
+            mesh2world=mesh2world,
+            reprojection_error=reprojection_error,
+            match_count=match_count,
+        ),
+        record,
+    )
+
+
 def render_candidate_matches(
     view: ViewData,
     mesh: trimesh.Trimesh,
@@ -378,87 +510,80 @@ def render_candidate_matches(
     if hasattr(match_result, "files"):
         match_result = {key: np.asarray(match_result[key]) for key in match_result.files}
 
-    valid_matches = match_result["matches"] > -1
-    if int(np.sum(valid_matches)) < MIN_VIEW_INLIERS:
+    candidate_records: list[dict[str, Any]] = []
+    candidate_indices: list[int] = []
+    for candidate_path in sorted(view_dir.glob("matches_*.npz")):
+        try:
+            candidate_indices.append(int(candidate_path.stem.split("_")[-1]))
+        except ValueError:
+            continue
+    if best_idx not in candidate_indices:
+        candidate_indices.append(int(best_idx))
+
+    def candidate_rank(candidate_idx: int) -> tuple[int, float]:
+        candidate_path = view_dir / f"matches_{candidate_idx}.npz"
+        if not candidate_path.exists():
+            return (0, 0.0)
+        with np.load(candidate_path) as data:
+            matches = np.asarray(data["matches"])
+            conf = np.asarray(data["match_confidence"])
+        valid = matches > -1
+        confidence = float(np.mean(conf[valid])) if np.any(valid) else 0.0
+        return (int(np.sum(valid)), confidence)
+
+    ranked_candidates = sorted(
+        set(candidate_indices),
+        key=lambda idx: (*candidate_rank(idx), -abs(idx - int(best_idx))),
+        reverse=True,
+    )
+    best_payload: ViewMatch | None = None
+    best_record: dict[str, Any] | None = None
+    for candidate_idx in ranked_candidates:
+        candidate_path = view_dir / f"matches_{candidate_idx}.npz"
+        if candidate_path.exists():
+            with np.load(candidate_path) as data:
+                candidate_result = {key: np.asarray(data[key]) for key in data.files}
+        elif candidate_idx == best_idx:
+            candidate_result = match_result
+        else:
+            continue
+        payload, record = solve_view_match_candidate(
+            view,
+            candidate_result,
+            candidate_idx,
+            colors[candidate_idx],
+            depths[candidate_idx],
+            camera_poses[candidate_idx].cpu().numpy(),
+            render_intrinsic,
+            bbox,
+        )
+        candidate_records.append(record)
+        if payload is None:
+            continue
+        if best_payload is None:
+            best_payload = payload
+            best_record = record
+            continue
+        assert best_record is not None
+        current_key = (
+            int(record["pnp_inliers"]),
+            -float(record["reprojection_error"]),
+            int(record["match_count"]),
+        )
+        best_key = (
+            int(best_record["pnp_inliers"]),
+            -float(best_record["reprojection_error"]),
+            int(best_record["match_count"]),
+        )
+        if current_key > best_key:
+            best_payload = payload
+            best_record = record
+
+    with (view_dir / "pnp_candidates.json").open("w") as handle:
+        json.dump(candidate_records, handle, indent=2)
+    if best_payload is None:
         return None
-
-    render_points = match_result["keypoints0"][valid_matches]
-    mesh_points, valid_depth = project_2d_to_3d(
-        render_points, depths[best_idx], render_intrinsic, camera_poses[best_idx].cpu().numpy()
-    )
-    raw_pixels_box = match_result["keypoints1"][match_result["matches"][valid_matches]]
-    raw_pixels_box = raw_pixels_box[valid_depth]
-    raw_pixels = raw_pixels_box + np.array([bbox[0], bbox[1]])
-    if mesh_points.shape[0] < MIN_VIEW_INLIERS:
-        return None
-
-    target_pixels, target_world = select_point(view.points, raw_pixels, view.object_mask)
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        np.float32(mesh_points),
-        np.float32(raw_pixels),
-        np.float32(view.intrinsic),
-        distCoeffs=np.zeros(4, dtype=np.float32),
-        flags=cv2.SOLVEPNP_EPNP,
-        iterationsCount=200,
-        reprojectionError=15.0,
-        confidence=0.99,
-    )
-    if not success or inliers is None or len(inliers) < MIN_VIEW_INLIERS:
-        return None
-    inlier_ids = inliers.reshape(-1)
-    cv2.solvePnP(
-        np.float32(mesh_points[inlier_ids]),
-        np.float32(raw_pixels[inlier_ids]),
-        np.float32(view.intrinsic),
-        np.zeros(4, dtype=np.float32),
-        rvec,
-        tvec,
-        useExtrinsicGuess=True,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
-    projected, _ = cv2.projectPoints(
-        np.float32(mesh_points[inlier_ids]),
-        rvec,
-        tvec,
-        view.intrinsic,
-        np.zeros(4, dtype=np.float32),
-    )
-    reprojection_error = float(
-        np.linalg.norm(raw_pixels[inlier_ids] - projected.reshape(-1, 2), axis=1).mean()
-    )
-
-    rotation, _ = cv2.Rodrigues(rvec)
-    mesh2camera = np.eye(4, dtype=np.float64)
-    mesh2camera[:3, :3] = rotation
-    mesh2camera[:3, 3] = tvec.reshape(-1)
-
-    mesh_cam = transform_points(mesh2camera, mesh_points[inlier_ids])
-    target_cam = transform_points(view.w2c, target_world[inlier_ids])
-    scale = solve_scale(mesh_cam, target_cam)
-    scale_matrix = np.eye(4, dtype=np.float64) * scale
-    scale_matrix[3, 3] = 1.0
-    mesh2world = view.c2w @ scale_matrix @ mesh2camera
-
-    payload = ViewMatch(
-        view=view.view,
-        view_index=view.index,
-        best_color=colors[best_idx],
-        best_depth=depths[best_idx],
-        best_pose=camera_poses[best_idx].cpu().numpy(),
-        render_intrinsic=render_intrinsic,
-        match_result=match_result,
-        bbox=bbox,
-        mesh_points=mesh_points,
-        raw_pixels=raw_pixels,
-        target_pixels=target_pixels,
-        target_world=target_world,
-        inliers=inlier_ids,
-        mesh2camera=mesh2camera,
-        scale=scale,
-        mesh2world=mesh2world,
-        reprojection_error=reprojection_error,
-        match_count=int(np.sum(valid_matches)),
-    )
+    payload = best_payload
     with cache_path.open("wb") as handle:
         pickle.dump(
             {
@@ -508,12 +633,17 @@ def evaluate_transform(
     matrix: np.ndarray,
     mesh_samples: np.ndarray,
     obs_tree: cKDTree,
+    obs_eval_points: np.ndarray,
     views: list[ViewData],
     matches: list[ViewMatch],
     weights: dict[str, float],
+    vertex_to_obs_gate: float,
+    obs_to_vertex_gate: float,
 ) -> dict[str, float]:
     samples_world = transform_points(matrix, mesh_samples)
     d_mesh_to_obs, _ = obs_tree.query(samples_world, k=1)
+    sample_tree = cKDTree(samples_world)
+    d_obs_to_mesh, _ = sample_tree.query(obs_eval_points, k=1)
 
     keypoint_residuals: list[np.ndarray] = []
     reprojection_residuals: list[np.ndarray] = []
@@ -533,12 +663,20 @@ def evaluate_transform(
         if reprojection_residuals
         else 1.0
     )
-    chamfer_loss = robust_mean(d_mesh_to_obs, 0.04)
+    vertex_to_obs_p95 = float(np.percentile(d_mesh_to_obs, 95))
+    obs_to_vertex_p95 = float(np.percentile(d_obs_to_mesh, 95))
+    chamfer_loss = robust_mean(d_mesh_to_obs / max(vertex_to_obs_gate, 1e-6), 1.0)
+    coverage_loss = robust_mean(d_obs_to_mesh / max(obs_to_vertex_gate, 1e-6), 1.0)
+    p95_loss = (
+        vertex_to_obs_p95 / max(vertex_to_obs_gate, 1e-6)
+        + obs_to_vertex_p95 / max(obs_to_vertex_gate, 1e-6)
+    )
+    pcd_loss = chamfer_loss + 0.5 * coverage_loss + 0.5 * p95_loss
     silhouette_loss, depth_loss = silhouette_depth_score(samples_world, views)
     total = (
         10.0 * keypoint_loss
         + reprojection_loss
-        + weights["pcd"] * chamfer_loss
+        + weights["pcd"] * pcd_loss
         + weights["silhouette"] * silhouette_loss
         + weights["depth"] * depth_loss
     )
@@ -547,6 +685,10 @@ def evaluate_transform(
         "keypoint": float(keypoint_loss),
         "reprojection": float(reprojection_loss),
         "chamfer": float(chamfer_loss),
+        "coverage": float(coverage_loss),
+        "pcd": float(pcd_loss),
+        "vertex_to_obs_p95": vertex_to_obs_p95,
+        "obs_to_vertex_p95": obs_to_vertex_p95,
         "silhouette": float(silhouette_loss),
         "depth": float(depth_loss),
     }
@@ -556,6 +698,7 @@ def optimize_sim3(
     initial_matrix: np.ndarray,
     mesh_samples: np.ndarray,
     obs_tree: cKDTree,
+    obs_eval_points: np.ndarray,
     views: list[ViewData],
     matches: list[ViewMatch],
     args: argparse.Namespace,
@@ -568,11 +711,29 @@ def optimize_sim3(
 
     def objective(params: np.ndarray) -> float:
         matrix = params_to_matrix(params)
-        return evaluate_transform(matrix, mesh_samples, obs_tree, views, matches, weights)["total"]
+        return evaluate_transform(
+            matrix,
+            mesh_samples,
+            obs_tree,
+            obs_eval_points,
+            views,
+            matches,
+            weights,
+            args.vertex_to_obs_gate,
+            args.obs_to_vertex_gate,
+        )["total"]
 
     initial_params = matrix_to_params(initial_matrix)
     initial_metrics = evaluate_transform(
-        initial_matrix, mesh_samples, obs_tree, views, matches, weights
+        initial_matrix,
+        mesh_samples,
+        obs_tree,
+        obs_eval_points,
+        views,
+        matches,
+        weights,
+        args.vertex_to_obs_gate,
+        args.obs_to_vertex_gate,
     )
     result = minimize(
         objective,
@@ -581,7 +742,17 @@ def optimize_sim3(
         options={"maxiter": max(args.silhouette_iters, 1), "xtol": 1e-4, "ftol": 1e-4},
     )
     matrix = params_to_matrix(result.x)
-    final_metrics = evaluate_transform(matrix, mesh_samples, obs_tree, views, matches, weights)
+    final_metrics = evaluate_transform(
+        matrix,
+        mesh_samples,
+        obs_tree,
+        obs_eval_points,
+        views,
+        matches,
+        weights,
+        args.vertex_to_obs_gate,
+        args.obs_to_vertex_gate,
+    )
     return matrix, {
         "optimizer_success": bool(result.success),
         "optimizer_message": str(result.message),
@@ -648,9 +819,21 @@ def deform_arap(
     tree = KDTree(np.asarray(mesh_world.vertices))
     _, indices = tree.query(keypoint_mesh_world)
     indices = np.asarray(indices, dtype=np.int32)
+    unique_indices: list[int] = []
+    unique_targets: list[np.ndarray] = []
+    for index, target in zip(indices, keypoint_targets):
+        index = int(index)
+        if index in unique_indices:
+            unique_targets[unique_indices.index(index)] = target
+        else:
+            unique_indices.append(index)
+            unique_targets.append(target)
+    indices = np.asarray(unique_indices, dtype=np.int32)
+    if len(indices) == 0:
+        return copy.deepcopy(mesh_world), indices
     deformed = mesh_world.deform_as_rigid_as_possible(
         o3d.utility.IntVector(indices),
-        o3d.utility.Vector3dVector(keypoint_targets),
+        o3d.utility.Vector3dVector(unique_targets),
         max_iter=1,
     )
     return deformed, indices
@@ -685,16 +868,6 @@ def deform_arap_ray_registration(
             if int(index) not in final_indices:
                 final_indices.append(int(index))
                 final_targets.append(target)
-
-    for index in np.where(np.asarray(mesh_world.vertices)[:, 2] > 0)[0]:
-        index = int(index)
-        target = np.asarray(mesh_world.vertices)[index].copy()
-        target[2] = 0
-        if index in final_indices:
-            final_targets[final_indices.index(index)] = target
-        else:
-            final_indices.append(index)
-            final_targets.append(target)
 
     return mesh_world.deform_as_rigid_as_possible(
         o3d.utility.IntVector(final_indices),
@@ -760,6 +933,13 @@ def save_projection_overlays(
 
 def compute_distance_metrics(mesh_path: Path, obs_points: np.ndarray) -> dict[str, float]:
     mesh = trimesh.load(mesh_path, force="mesh", process=False)
+    return compute_trimesh_distance_metrics(mesh, obs_points)
+
+
+def compute_trimesh_distance_metrics(
+    mesh: trimesh.Trimesh,
+    obs_points: np.ndarray,
+) -> dict[str, float]:
     verts = np.asarray(mesh.vertices)
     obs_tree = cKDTree(obs_points)
     vertex_to_obs, _ = obs_tree.query(verts, k=1)
@@ -773,6 +953,139 @@ def compute_distance_metrics(mesh_path: Path, obs_points: np.ndarray) -> dict[st
         "obs_to_vertex_median": float(np.median(obs_to_vertex)),
         "obs_to_vertex_p95": float(np.percentile(obs_to_vertex, 95)),
     }
+
+
+def quality_gate_status(
+    metrics: dict[str, float],
+    args: argparse.Namespace,
+    valid_views: int,
+    total_inliers: int,
+) -> dict[str, Any]:
+    gates = {
+        "valid_views": valid_views >= 2,
+        "total_inliers": total_inliers >= MIN_TOTAL_INLIERS,
+        "vertex_to_obs_p95": metrics["vertex_to_obs_p95"] <= args.vertex_to_obs_gate,
+        "obs_to_vertex_p95": metrics["obs_to_vertex_p95"] <= args.obs_to_vertex_gate,
+    }
+    return {
+        "thresholds": {
+            "valid_views": 2,
+            "total_inliers": MIN_TOTAL_INLIERS,
+            "vertex_to_obs_p95": args.vertex_to_obs_gate,
+            "obs_to_vertex_p95": args.obs_to_vertex_gate,
+        },
+        "checks": gates,
+        "passed": all(gates.values()),
+    }
+
+
+def mesh_quality_score(metrics: dict[str, float], args: argparse.Namespace) -> float:
+    vertex_ratio = metrics["vertex_to_obs_p95"] / max(args.vertex_to_obs_gate, 1e-6)
+    obs_ratio = metrics["obs_to_vertex_p95"] / max(args.obs_to_vertex_gate, 1e-6)
+    median_ratio = metrics["vertex_to_obs_median"] / max(args.vertex_to_obs_gate, 1e-6)
+    gate_penalty = max(vertex_ratio - 1.0, 0.0) ** 2 + max(obs_ratio - 1.0, 0.0) ** 2
+    return float(vertex_ratio + obs_ratio + 0.25 * median_ratio + 10.0 * gate_penalty)
+
+
+def sim3_gate_aware_score(metrics: dict[str, float], args: argparse.Namespace) -> float:
+    vertex_excess = max(metrics["vertex_to_obs_p95"] - args.vertex_to_obs_gate, 0.0)
+    obs_excess = max(metrics["obs_to_vertex_p95"] - args.obs_to_vertex_gate, 0.0)
+    vertex_ratio = vertex_excess / max(args.vertex_to_obs_gate, 1e-6)
+    obs_ratio = obs_excess / max(args.obs_to_vertex_gate, 1e-6)
+    # Gate violations decide first; the optimizer objective only breaks ties.
+    return float(1000.0 * (vertex_ratio + obs_ratio) + metrics["total"])
+
+
+def preserves_p95_gates(
+    candidate: dict[str, float],
+    baseline: dict[str, float],
+) -> bool:
+    return (
+        candidate["vertex_to_obs_p95"]
+        <= baseline["vertex_to_obs_p95"] + QUALITY_TOLERANCE
+        and candidate["obs_to_vertex_p95"]
+        <= baseline["obs_to_vertex_p95"] + QUALITY_TOLERANCE
+    )
+
+
+def make_o3d_mesh(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
+    o3d_mesh = o3d.geometry.TriangleMesh()
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
+    return o3d_mesh
+
+
+def world_o3d_to_trimesh(
+    template: trimesh.Trimesh,
+    mesh_world: o3d.geometry.TriangleMesh,
+    trimesh_indices: np.ndarray,
+) -> trimesh.Trimesh:
+    output = template.copy()
+    output.vertices = np.asarray(mesh_world.vertices)[trimesh_indices]
+    return output
+
+
+def mask_supported_vertices(vertices: np.ndarray, views: list[ViewData]) -> np.ndarray:
+    supported = np.zeros(len(vertices), dtype=bool)
+    for view in views:
+        pixels, valid = project_world_to_view(vertices, view)
+        if not np.any(valid):
+            continue
+        valid_indices = np.where(valid)[0]
+        xy = np.floor(pixels[valid]).astype(np.int32)
+        xy[:, 0] = np.clip(xy[:, 0], 0, view.mask_img.shape[1] - 1)
+        xy[:, 1] = np.clip(xy[:, 1], 0, view.mask_img.shape[0] - 1)
+        in_mask = view.mask_img[xy[:, 1], xy[:, 0]] > 0
+        supported[valid_indices[in_mask]] = True
+    return supported
+
+
+def prune_far_unsupported_faces(
+    mesh: trimesh.Trimesh,
+    obs_points: np.ndarray,
+    views: list[ViewData],
+    max_dist: float,
+) -> tuple[trimesh.Trimesh | None, dict[str, Any]]:
+    if max_dist <= 0 or len(mesh.faces) == 0:
+        return None, {"attempted": False, "reason": "disabled"}
+
+    vertices = np.asarray(mesh.vertices)
+    distances, _ = cKDTree(obs_points).query(vertices, k=1)
+    supported = mask_supported_vertices(vertices, views)
+    far_unsupported = (distances > max_dist) & ~supported
+    face_flags = np.sum(far_unsupported[np.asarray(mesh.faces)], axis=1) >= 2
+    remove_count = int(np.sum(face_flags))
+    if remove_count == 0:
+        return None, {"attempted": True, "removed_faces": 0, "reason": "no_far_unsupported_faces"}
+
+    keep_faces = ~face_flags
+    if int(np.sum(keep_faces)) < 100:
+        return None, {
+            "attempted": True,
+            "removed_faces": remove_count,
+            "reason": "too_few_faces_remaining",
+        }
+
+    pruned = mesh.copy()
+    pruned.update_faces(keep_faces)
+    pruned.remove_unreferenced_vertices()
+    components = pruned.split(only_watertight=False)
+    if len(components) > 1:
+        pruned = max(components, key=lambda component: len(component.faces))
+    return pruned, {
+        "attempted": True,
+        "removed_faces": remove_count,
+        "remaining_faces": int(len(pruned.faces)),
+        "far_unsupported_vertices": int(np.sum(far_unsupported)),
+    }
+
+
+def choose_observation_eval_points(obs_points: np.ndarray, max_points: int = 6000) -> np.ndarray:
+    if len(obs_points) <= max_points:
+        return obs_points
+    rng = np.random.default_rng(42)
+    indices = rng.choice(len(obs_points), size=max_points, replace=False)
+    return obs_points[np.sort(indices)]
 
 
 def main() -> int:
@@ -820,35 +1133,64 @@ def main() -> int:
     np.random.seed(42)
     sample_count = min(6000, max(1000, len(mesh.faces)))
     mesh_samples, _ = trimesh.sample.sample_surface(mesh, sample_count)
+    obs_eval_points = choose_observation_eval_points(obs_points)
     candidate_scores = []
-    for match in matches:
-        score = evaluate_transform(
-            match.mesh2world,
-            mesh_samples,
-            obs_tree,
-            views,
-            matches,
-            {"pcd": args.pcd_weight, "silhouette": args.silhouette_weight, "depth": args.depth_weight},
-        )
-        candidate_scores.append((score["total"], match.view, match.mesh2world, score))
-    candidate_scores.sort(key=lambda item: item[0])
-    initial_matrix = candidate_scores[0][2]
-    best_score = candidate_scores[0][0]
-    trusted_views = {
-        view for total, view, _, _ in candidate_scores if total <= best_score * 1.5
+    optimized_candidates: list[dict[str, Any]] = []
+    weights = {
+        "pcd": args.pcd_weight,
+        "silhouette": args.silhouette_weight,
+        "depth": args.depth_weight,
     }
-    active_matches = [match for match in matches if match.view in trusted_views]
-    if not active_matches:
-        active_matches = [next(match for match in matches if match.view == candidate_scores[0][1])]
-
-    optimized_matrix, optimizer_metrics = optimize_sim3(
-        initial_matrix,
-        mesh_samples,
-        obs_tree,
-        views,
-        active_matches,
-        args,
-    )
+    for match in matches:
+        for scale_multiplier in SIM3_SCALE_MULTIPLIERS:
+            start_matrix = scaled_sim3_matrix(match.mesh2world, scale_multiplier)
+            initial_score = evaluate_transform(
+                start_matrix,
+                mesh_samples,
+                obs_tree,
+                obs_eval_points,
+                views,
+                matches,
+                weights,
+                args.vertex_to_obs_gate,
+                args.obs_to_vertex_gate,
+            )
+            optimized_matrix, optimizer_metrics = optimize_sim3(
+                start_matrix,
+                mesh_samples,
+                obs_tree,
+                obs_eval_points,
+                views,
+                matches,
+                args,
+            )
+            optimized_score = optimizer_metrics["final"]
+            optimizer_loss = float(optimized_score["total"])
+            quality_score = sim3_gate_aware_score(optimized_score, args)
+            candidate_record = {
+                "view": match.view,
+                "scale_multiplier": scale_multiplier,
+                "initial": initial_score,
+                "optimized": optimized_score,
+                "quality_score": quality_score,
+                "optimizer_loss": optimizer_loss,
+                "optimizer": optimizer_metrics,
+                "matrix": optimized_matrix,
+            }
+            optimized_candidates.append(candidate_record)
+            candidate_scores.append(
+                {
+                    "view": match.view,
+                    "scale_multiplier": scale_multiplier,
+                    "total": optimizer_loss,
+                    "gate_aware_score": quality_score,
+                    **optimized_score,
+                }
+            )
+    optimized_candidates.sort(key=lambda item: item["quality_score"])
+    selected_sim3 = optimized_candidates[0]
+    optimized_matrix = selected_sim3["matrix"]
+    active_matches = matches
 
     all_mesh_keypoints = []
     all_targets = []
@@ -859,40 +1201,135 @@ def main() -> int:
     keypoint_mesh_world = np.vstack(all_mesh_keypoints)
     keypoint_targets = np.vstack(all_targets)
 
-    initial_mesh_world = o3d.geometry.TriangleMesh()
-    initial_mesh_world.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
-    initial_mesh_world.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
+    initial_mesh_world = make_o3d_mesh(mesh)
     initial_mesh_world = initial_mesh_world.remove_duplicated_vertices()
     tree = KDTree(np.asarray(initial_mesh_world.vertices))
     _, trimesh_indices = tree.query(np.asarray(mesh.vertices))
     trimesh_indices = np.asarray(trimesh_indices, dtype=np.int32)
     initial_mesh_world.transform(optimized_matrix)
 
-    deformed_keypoint_mesh, keypoint_indices = deform_arap(
-        initial_mesh_world,
-        keypoint_mesh_world,
-        keypoint_targets,
-    )
+    stage_metrics: dict[str, Any] = {}
+
+    def build_stage_candidate(name: str, o3d_mesh: o3d.geometry.TriangleMesh) -> dict[str, Any]:
+        trimesh_candidate = world_o3d_to_trimesh(mesh, o3d_mesh, trimesh_indices)
+        distance_metrics = compute_trimesh_distance_metrics(trimesh_candidate, obs_points)
+        return {
+            "name": name,
+            "o3d_mesh": o3d_mesh,
+            "trimesh": trimesh_candidate,
+            "distance_metrics": distance_metrics,
+            "quality_score": mesh_quality_score(distance_metrics, args),
+        }
+
+    selected_stage = build_stage_candidate("sim3_only", initial_mesh_world)
+    stage_metrics["sim3_only"] = {
+        "distance_metrics": selected_stage["distance_metrics"],
+        "quality_score": selected_stage["quality_score"],
+        "accepted": True,
+    }
+
+    keypoint_indices = np.zeros((0,), dtype=np.int32)
+    try:
+        deformed_keypoint_mesh, keypoint_indices = deform_arap(
+            copy.deepcopy(initial_mesh_world),
+            keypoint_mesh_world,
+            keypoint_targets,
+        )
+        keypoint_stage = build_stage_candidate("keypoint_arap", deformed_keypoint_mesh)
+        keypoint_accepted = preserves_p95_gates(
+            keypoint_stage["distance_metrics"], selected_stage["distance_metrics"]
+        )
+        if keypoint_accepted:
+            selected_stage = keypoint_stage
+        stage_metrics["keypoint_arap"] = {
+            "distance_metrics": keypoint_stage["distance_metrics"],
+            "quality_score": keypoint_stage["quality_score"],
+            "accepted": keypoint_accepted,
+        }
+    except RuntimeError as exc:
+        stage_metrics["keypoint_arap"] = {
+            "accepted": False,
+            "error": str(exc),
+        }
+
     mesh_for_rays = trimesh.Trimesh(
         vertices=np.asarray(mesh.vertices).copy(),
         faces=np.asarray(mesh.faces).copy(),
         process=False,
     )
-    final_mesh_world = deform_arap_ray_registration(
-        deformed_keypoint_mesh,
-        obs_points,
-        mesh_for_rays,
-        trimesh_indices,
-        views,
-        keypoint_indices,
-        keypoint_targets,
-    )
+    if args.disable_ray_arap or len(keypoint_indices) == 0:
+        stage_metrics["ray_arap"] = {"accepted": False, "skipped": True}
+    else:
+        try:
+            ray_mesh = deform_arap_ray_registration(
+                copy.deepcopy(selected_stage["o3d_mesh"]),
+                obs_points,
+                mesh_for_rays,
+                trimesh_indices,
+                views,
+                keypoint_indices,
+                keypoint_targets,
+            )
+            ray_stage = build_stage_candidate("ray_arap", ray_mesh)
+            ray_accepted = preserves_p95_gates(
+                ray_stage["distance_metrics"], selected_stage["distance_metrics"]
+            )
+            if ray_accepted:
+                selected_stage = ray_stage
+            stage_metrics["ray_arap"] = {
+                "distance_metrics": ray_stage["distance_metrics"],
+                "quality_score": ray_stage["quality_score"],
+                "accepted": ray_accepted,
+                "skipped": False,
+            }
+        except Exception as exc:
+            stage_metrics["ray_arap"] = {
+                "accepted": False,
+                "skipped": False,
+                "error": str(exc),
+            }
 
-    mesh.vertices = np.asarray(final_mesh_world.vertices)[trimesh_indices]
+    prune_candidate, prune_info = prune_far_unsupported_faces(
+        selected_stage["trimesh"],
+        obs_points,
+        views,
+        args.prune_far_dist,
+    )
+    if prune_candidate is not None:
+        prune_metrics = compute_trimesh_distance_metrics(prune_candidate, obs_points)
+        prune_info["distance_metrics"] = prune_metrics
+        prune_info["quality_score"] = mesh_quality_score(prune_metrics, args)
+        prune_accepted = (
+            prune_metrics["vertex_to_obs_p95"]
+            < selected_stage["distance_metrics"]["vertex_to_obs_p95"]
+            and prune_metrics["obs_to_vertex_p95"]
+            <= selected_stage["distance_metrics"]["obs_to_vertex_p95"] + QUALITY_TOLERANCE
+        )
+        prune_info["accepted"] = prune_accepted
+        if prune_accepted:
+            selected_stage = {
+                "name": "pruned_envelope",
+                "o3d_mesh": make_o3d_mesh(prune_candidate),
+                "trimesh": prune_candidate,
+                "distance_metrics": prune_metrics,
+                "quality_score": prune_info["quality_score"],
+            }
+    else:
+        prune_info["accepted"] = False
+    stage_metrics["pruned_envelope"] = prune_info
+
+    final_mesh = selected_stage["trimesh"]
+    final_mesh_world = selected_stage["o3d_mesh"]
     final_mesh_path = output_dir / "final_mesh.glb"
-    mesh.export(final_mesh_path)
+    final_mesh.export(final_mesh_path)
     write_final_matching_video(output_dir, final_mesh_world, obs_points, obs_colors)
-    save_projection_overlays(debug_dir, transform_points(optimized_matrix, mesh_samples), views)
+    overlay_samples, _ = trimesh.sample.sample_surface(
+        final_mesh, min(6000, max(1000, len(final_mesh.faces)))
+    )
+    save_projection_overlays(debug_dir, overlay_samples, views)
+
+    distance_metrics = compute_distance_metrics(final_mesh_path, obs_points)
+    quality_gates = quality_gate_status(distance_metrics, args, len(matches), total_inliers)
 
     metrics: dict[str, Any] = {
         "case_name": args.case_name,
@@ -900,11 +1337,10 @@ def main() -> int:
         "valid_views": len(matches),
         "active_keypoint_views": [match.view for match in active_matches],
         "total_inliers": total_inliers,
-        "best_initial_view": candidate_scores[0][1],
-        "candidate_scores": [
-            {"view": view, "total": float(total), **score}
-            for total, view, _, score in candidate_scores
-        ],
+        "best_initial_view": selected_sim3["view"],
+        "selected_scale_multiplier": selected_sim3["scale_multiplier"],
+        "selected_stage": selected_stage["name"],
+        "candidate_scores": candidate_scores,
         "view_matches": [
             {
                 "view": match.view,
@@ -915,8 +1351,14 @@ def main() -> int:
             }
             for match in matches
         ],
-        "optimizer": optimizer_metrics,
-        "distance_metrics": compute_distance_metrics(final_mesh_path, obs_points),
+        "optimizer": selected_sim3["optimizer"],
+        "sim3_optimization": {
+            "scale_multipliers": list(SIM3_SCALE_MULTIPLIERS),
+            "candidate_count": len(optimized_candidates),
+        },
+        "stage_metrics": stage_metrics,
+        "distance_metrics": distance_metrics,
+        "quality_gates": quality_gates,
         "outputs": {
             "final_mesh": str(final_mesh_path),
             "final_matching": str(output_dir / "final_matching.mp4"),

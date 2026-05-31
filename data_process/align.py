@@ -1,6 +1,7 @@
 import open3d as o3d
 import numpy as np
 from argparse import ArgumentParser
+import copy
 import pickle
 import trimesh
 import cv2
@@ -159,11 +160,26 @@ def deform_ARAP(initial_mesh_world, mesh_matching_points_world, matching_points)
     _, mesh_points_indices = kdtree.query(mesh_matching_points_world)
     mesh_points_indices = np.asarray(mesh_points_indices, dtype=np.int32)
     # shape: mesh_matching_points_world/matching_points (K, 3); mesh_points_indices (K,).
-    deform_mesh = initial_mesh_world.deform_as_rigid_as_possible(
-        o3d.utility.IntVector(mesh_points_indices),
-        o3d.utility.Vector3dVector(matching_points),
-        max_iter=1,
-    )
+    unique_indices, inverse = np.unique(mesh_points_indices, return_inverse=True)
+    if unique_indices.shape[0] != mesh_points_indices.shape[0]:
+        unique_targets = np.zeros((unique_indices.shape[0], 3), dtype=np.float64)
+        counts = np.zeros(unique_indices.shape[0], dtype=np.float64)
+        for source_idx, target in zip(inverse, matching_points):
+            unique_targets[source_idx] += target
+            counts[source_idx] += 1
+        unique_targets /= counts[:, None]
+        mesh_points_indices = unique_indices.astype(np.int32)
+        matching_points = unique_targets
+
+    try:
+        deform_mesh = initial_mesh_world.deform_as_rigid_as_possible(
+            o3d.utility.IntVector(mesh_points_indices),
+            o3d.utility.Vector3dVector(matching_points),
+            max_iter=1,
+        )
+    except RuntimeError as exc:
+        print(f"[align.py][warn] ARAP failed; keeping pre-ARAP mesh. Error: {exc}")
+        deform_mesh = copy.deepcopy(initial_mesh_world)
     return deform_mesh, mesh_points_indices
 
 
@@ -284,11 +300,17 @@ def deform_ARAP_ray_registration(
                 target[2] = 0
                 final_targets[final_indices.index(index)] = target
 
-    final_mesh_world = deform_kp_mesh_world.deform_as_rigid_as_possible(
-        o3d.utility.IntVector(final_indices),
-        o3d.utility.Vector3dVector(final_targets),
-        max_iter=1,
-    )
+    try:
+        final_mesh_world = deform_kp_mesh_world.deform_as_rigid_as_possible(
+            o3d.utility.IntVector(final_indices),
+            o3d.utility.Vector3dVector(final_targets),
+            max_iter=1,
+        )
+    except RuntimeError as exc:
+        print(
+            f"[align.py][warn] Ray/ground ARAP failed; keeping keypoint-aligned mesh. Error: {exc}"
+        )
+        final_mesh_world = copy.deepcopy(deform_kp_mesh_world)
     return final_mesh_world
 
 
@@ -592,6 +614,9 @@ if __name__ == "__main__":
     # shape: mesh.vertices (V, 3); mesh.faces (F, 3).
     # Need to remove the duplicated vertices to enable open3d, however, the duplicated points are important in trimesh for texture
     initial_mesh_world = initial_mesh_world.remove_duplicated_vertices()
+    initial_mesh_world = initial_mesh_world.remove_degenerate_triangles()
+    initial_mesh_world = initial_mesh_world.remove_duplicated_triangles()
+    initial_mesh_world = initial_mesh_world.remove_non_manifold_edges()
     # Get the index from original vertices to the mesh vertices, mapping between trimesh and open3d
     kdtree = KDTree(initial_mesh_world.vertices)
     _, trimesh_indices = kdtree.query(np.asarray(mesh.vertices))
@@ -633,7 +658,7 @@ if __name__ == "__main__":
         dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
         # shape: dummy_frame (H_render, W_render, 3), float RGB.
         height, width, _ = dummy_frame.shape
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         video_writer = cv2.VideoWriter(
             f"{output_dir}/final_matching.mp4", fourcc, 30, (width, height)
         )

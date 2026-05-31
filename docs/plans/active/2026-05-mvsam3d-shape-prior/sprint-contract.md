@@ -2,181 +2,103 @@
 
 ## Contract ID
 
-`mvsam3d-shape-prior-backend`
+`shape-prior-route-split`
 
 ## Goal
 
-Replace the SAM3D single-view shape-prior stage with a default MV-SAM3D
-multi-view backend and route MV-SAM3D cases through an MV-specific multi-view
-align and sampling path, while keeping the old SAM3D/Trellis path as an
-explicit fallback.
+Split the current mixed SAM3D/MV-SAM3D data-process entrypoint into a
+production single-view route and an explicit experimental MV-SAM3D route.
+Ordinary SAM3D and Trellis should mainly follow the original `data_process`
+semantics; MV-SAM3D should no longer be the default or share ambiguous route
+flags with single-view backends.
 
-## Agreed Scope
+## Files Expected To Change
 
-Files expected to change:
-
-- `data_process_sam3d/prepare_mvsam3d_scene.py`
-- `data_process_sam3d/shape_prior_mvsam3d.py`
-- `data_process_sam3d/align_mvsam3d.py`
-- `data_process_sam3d/utils/align_util.py`
-- `data_process_sam3d/align.py`
-- `data_process_sam3d/data_process_sample.py`
+- `process_data_routes.py`
+- `process_data_single_view.py`
+- `process_data_mvsam3d.py`
+- `script_process_data_single_view.py`
+- `script_process_data_mvsam3d.py`
 - `process_data_sam3d.py`
 - `script_process_data_sam3d.py`
 - `README.md`
+- `docs/plans/active/2026-05-mvsam3d-shape-prior/task-brief.md`
+- `docs/plans/active/2026-05-mvsam3d-shape-prior/sprint-contract.md`
 - `docs/plans/active/2026-05-mvsam3d-shape-prior/qa-report.md`
 - `docs/plans/active/2026-05-mvsam3d-shape-prior/handoff.md`
 
-Files expected to read:
-
-- `AGENTS.md`
-- `HARNESS.md`
-- `docs/harness/README.md`
-- `docs/harness/operating-model.md`
-- `docs/harness/verification.md`
-- `data_process_sam3d/shape_prior.py`
-- `data_process_sam3d/align.py`
-- `data_process_sam3d/align_mvsam3d.py`
-- `data_process_sam3d/data_process_sample.py`
-- `process_data.py`
-- `script_process_data.py`
-
-Out of scope:
-
-- Rewriting segmentation, tracking, point-cloud lifting, mask post-processing,
-  controller logic, or upstream case generation.
-- Adding multi-object downstream support.
-- Vendoring MV-SAM3D, DA3, checkpoints, tokens, caches, or generated assets.
+Existing MV implementation files may remain dirty from prior align/sampling QA,
+but this route split should not rewrite them except for verification-driven
+fixes.
 
 ## Behavior To Deliver
 
-- Build an MV-SAM3D scene from all available frame-0 camera views, using each
-  camera's own `mask_info_<cam_idx>.json` to select exactly one non-controller
-  object.
-- By default, mirror the legacy SAM3D pre-shape-prior preparation for each
-  selected MV-SAM3D view: masked object crop upscale through `image_upscale.py`,
-  followed by `segment_util_image.py` to produce a high-resolution RGBA mask.
-  Keep `raw` as an explicit fallback input mode.
-- Write RGBA object masks whose alpha channel is foreground and record source
-  and generated paths in `shape/mvsam3d/manifest.json`.
-- Run external MV-SAM3D through `--mvsam3d_root`/`MVSAM3D_ROOT` and
-  `--mvsam3d_python`/`MVSAM3D_PYTHON`, with optional DA3 generation.
-- Normalize canonical MV-SAM3D object output to `shape/object.glb` and
-  optional `shape/object.ply`/`shape/visualization.mp4`.
-- Keep the full MV-SAM3D object mesh as a debug artifact and simplify the
-  downstream `shape/object.glb` to `--mvsam3d_max_faces` by default so
-  `align.py` receives the same single-object mesh semantic without excessive
-  render cost.
-- Preserve existing segmentation, tracking, and 3D processing behavior after
-  the shape-prior stage.
-- Add `data_process_sam3d/align_mvsam3d.py` for MV-SAM3D priors. It uses
-  frame-0 manifest views for multi-view matching, PnP candidate scoring,
-  shared Sim(3) optimization with reprojection/PCD/silhouette/depth terms, and
-  ARAP deformation against fused observations.
-- Keep `align.py` intact and available through `--align_backend legacy`.
-- Add MV-SAM3D adaptive sampling in `data_process_sample.py` so final data has
-  enough accepted surface/interior prior points after grid filtering.
+- Add `process_data_single_view.py`:
+  - `--single_view_backend {sam3d,trellis}`, default `sam3d`.
+  - Uses `data_process/segment.py`, `image_upscale.py`,
+    `segment_util_image.py`, `dense_track.py`, `data_process_pcd.py`,
+    `data_process_mask.py`, `data_process_track.py`, `align.py`, and
+    `data_process_sample.py`.
+  - Uses `data_process/shape_prior.py` for Trellis and
+    `data_process_sam3d/shape_prior.py` for SAM3D.
+  - Has no MV-SAM3D CLI flags.
+- Add `process_data_mvsam3d.py`:
+  - Uses `data_process_sam3d/shape_prior_mvsam3d.py`,
+    `data_process_sam3d/align_mvsam3d.py`, and
+    `data_process_sam3d/data_process_sample.py --shape_prior_sampling_backend
+    mvsam3d`.
+  - Defaults to frame-0 views `0,1,2` and `legacy_upscale`.
+  - Has no single-view backend switch.
+- Add matching batch scripts for each route.
+- Convert `process_data_sam3d.py` and `script_process_data_sam3d.py` to
+  compatibility shims:
+  - default `--shape_prior_backend sam3d`;
+  - `sam3d` forwards to the single-view route;
+  - `mvsam3d` forwards to the MV route;
+  - incompatible legacy flags fail clearly.
+- Write `shape/route_manifest.json` for every run with route, backend, command
+  records, output paths, and split metadata.
 
 ## Acceptance Criteria
 
-- Must: changed Python CLIs compile and expose expected help flags.
-- Must: dry-run mode reports the converter and external commands without
-  requiring MV-SAM3D imports.
-- Must: default `--shape_prior_backend` is `mvsam3d`; `sam3d` retains the old
-  image-upscale/masked-image/`shape_prior.py` path.
-- Must not: modify `data_config.csv` format or commit generated shape assets.
-- Must not: silently use merged DA3 scene GLBs as `shape/object.glb`.
-- Must: real MV-SAM3D GLBs with RGBA vertex colors remain renderable by
-  `align.py`.
-- Must: MV-SAM3D DA3 cache is separated by input preprocess backend so raw and
-  high-resolution scene inputs cannot silently share `da3_output.npz`.
-- Must: `--align_backend auto` routes MV-SAM3D priors to `align_mvsam3d.py` and
-  legacy priors to `align.py`.
-- Must: on `single_lift_sloth`, MV-SAM3D final data contains at least 700
-  surface points and 1000 interior points after MV sampling.
-
-## Evaluator Probes
-
-The evaluator should explicitly check:
-
-- Adapter handles per-view object-id resolution and rejects missing or empty
-  masks with actionable errors.
-- Process pipeline skips the single-view image-upscale/segment-util steps for
-  the MV-SAM3D backend.
-- Batch script passes MV-SAM3D flags only when relevant and keeps case filtering
-  compatible with existing `data_config.csv`.
-- QA report records real GPU/MV-SAM3D evidence when the runtime exists, or
-  skipped checks plus exact follow-up commands when it does not.
-- MV align metrics include valid views, inlier counts, distance metrics, output
-  paths, and any view-gating decision used for robust keypoint constraints.
+- Single-view SAM3D/Trellis output semantics match the original `data_process`
+  route except for the selected shape-prior generator.
+- MV-SAM3D remains isolated under its own entrypoint and debug directory.
+- No code path makes MV-SAM3D the default backend.
+- `data_config.csv` remains unchanged.
+- Public downstream outputs remain compatible with existing consumers:
+  `shape/object.glb`, `shape/matching/final_mesh.glb`, `final_data.pkl`,
+  `final_pcd.mp4`, `final_data.mp4`, and `split.json`.
 
 ## Verification Commands
 
 ```bash
-python -m py_compile process_data_sam3d.py script_process_data_sam3d.py data_process_sam3d/prepare_mvsam3d_scene.py data_process_sam3d/shape_prior_mvsam3d.py data_process_sam3d/align_mvsam3d.py data_process_sam3d/data_process_sample.py data_process_sam3d/utils/align_util.py
-python scripts/check_harness_docs.py
-python data_process_sam3d/prepare_mvsam3d_scene.py --help
-python data_process_sam3d/shape_prior_mvsam3d.py --help
-python data_process_sam3d/align_mvsam3d.py --help
-python data_process_sam3d/data_process_sample.py --help
+python -m py_compile process_data_routes.py process_data_single_view.py process_data_mvsam3d.py script_process_data_single_view.py script_process_data_mvsam3d.py process_data_sam3d.py script_process_data_sam3d.py
+python process_data_single_view.py --help
+python process_data_mvsam3d.py --help
+python script_process_data_single_view.py --help
+python script_process_data_mvsam3d.py --help
 python process_data_sam3d.py --help
 python script_process_data_sam3d.py --help
+python scripts/check_harness_docs.py
+git diff --check
 ```
 
-Add a local-case dry-run when case data is available:
+Functional follow-up, when runtime and case data are available:
 
 ```bash
-/home/xinjie/miniforge3/envs/phystwin-max/bin/python data_process_sam3d/shape_prior_mvsam3d.py \
-  --base_path ./data/different_types \
-  --case_name <case> \
-  --category <category> \
-  --controller_name hand \
-  --dry_run
-```
-
-Functional GPU follow-up:
-
-```bash
-/home/xinjie/miniforge3/envs/phystwin-max/bin/python process_data_sam3d.py \
-  --base_path ./data/different_types \
-  --case_name <case> \
-  --category <category> \
-  --shape_prior \
-  --shape_prior_backend mvsam3d \
-  --mvsam3d_run_da3 \
-  --mvsam3d_da3_model_path <optional-da3-snapshot-or-checkout>
-```
-
-MV align/sampling functional check:
-
-```bash
-xvfb-run -a /home/xinjie/miniforge3/envs/phystwin-max/bin/python data_process_sam3d/align_mvsam3d.py \
+/home/xinjie/miniforge3/envs/phystwin-max/bin/python process_data_single_view.py \
   --base_path ./data/different_types \
   --case_name single_lift_sloth \
-  --controller_name hand \
-  --force_rematch
-xvfb-run -a /home/xinjie/miniforge3/envs/phystwin-max/bin/python data_process_sam3d/data_process_sample.py \
+  --category sloth \
+  --shape_prior \
+  --single_view_backend sam3d
+
+/home/xinjie/miniforge3/envs/phystwin-max/bin/python process_data_mvsam3d.py \
   --base_path ./data/different_types \
   --case_name single_lift_sloth \
+  --category sloth \
   --shape_prior \
-  --shape_prior_sampling_backend mvsam3d
+  --mvsam3d_view_indices 0,1,2 \
+  --mvsam3d_input_preprocess_backend legacy_upscale
 ```
-
-## Contract Changes
-
-- 2026-05-24: Initial contract from the user request. The batch script is also
-  allowed to adopt the safer `script_process_data.py` subprocess/case-filter
-  style because the user asked to fix inconsistencies with the original data
-  processing part.
-- 2026-05-29: Real-data verification exposed two downstream compatibility
-  issues: dense MV meshes were too expensive for `align.py`, and PyTorch3D saw
-  RGBA vertex colors. The contract now includes default mesh simplification and
-  an align renderer guard while still preserving the single-object shape-prior
-  semantic.
-- 2026-05-29: User requested a full MV-SAM3D align rewrite after the first
-  `single_lift_sloth` comparison looked thinner than Trellis. Scope expanded to
-  include `align_mvsam3d.py`, `--align_backend auto`, MV adaptive final-data
-  sampling, and Trellis-vs-MV comparison artifacts.
-- 2026-05-29: User requested that MV-SAM3D also use the legacy high-resolution
-  pre-shape-prior step. Scope expanded to include per-view
-  `legacy_upscale` input preprocessing before MV-SAM3D inference.

@@ -169,7 +169,7 @@ def process_unique_points(track_data):
     dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
     # shape: dummy_frame (H_render, W_render, 3), float RGB.
     height, width, _ = dummy_frame.shape
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     video_writer = cv2.VideoWriter(
         f"{base_path}/{case_name}/final_pcd.mp4", fourcc, 30, (width, height)
     )
@@ -224,7 +224,7 @@ def visualize_track(track_data):
     dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
     # shape: dummy_frame (H_render, W_render, 3), float RGB.
     height, width, _ = dummy_frame.shape
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     video_writer = cv2.VideoWriter(
         f"{base_path}/{case_name}/final_data.mp4", fourcc, 30, (width, height)
     )

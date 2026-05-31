@@ -26,6 +26,7 @@ import numpy as np
 import supervision as sv
 import torch
 from PIL import Image
+from transformers import BertModel
 from groundingdino.util.inference import load_model, load_image, predict
 from sam2.build_sam import build_sam2, build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -49,6 +50,8 @@ parser.add_argument("--camera_idx", type=int)
 parser.add_argument("--output_path", type=str, default="NONE")
 parser.add_argument("--exclude_mask_info", type=str, default=None)
 parser.add_argument("--exclude_mask_root", type=str, default=None)
+parser.add_argument("--required_label", type=str, default=None)
+parser.add_argument("--required_label_min_count", type=int, default=None)
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -61,6 +64,39 @@ else:
     output_path = args.output_path
 exclude_mask_info_path = args.exclude_mask_info
 exclude_mask_root = args.exclude_mask_root
+
+
+def install_bert_head_mask_compat() -> None:
+    if not hasattr(BertModel, "get_head_mask"):
+        def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+            if head_mask is None:
+                return [None] * num_hidden_layers
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+            dtype = next(self.parameters()).dtype
+            return head_mask.to(dtype=dtype)
+
+        BertModel.get_head_mask = get_head_mask
+
+    if getattr(BertModel, "_fpt_extended_attention_mask_compat", False):
+        return
+
+    original_get_extended_attention_mask = BertModel.get_extended_attention_mask
+
+    def get_extended_attention_mask(self, attention_mask, input_shape, dtype=None):
+        if isinstance(dtype, torch.device):
+            dtype = next(self.parameters()).dtype
+        return original_get_extended_attention_mask(
+            self, attention_mask, input_shape, dtype=dtype
+        )
+
+    BertModel.get_extended_attention_mask = get_extended_attention_mask
+    BertModel._fpt_extended_attention_mask_compat = True
 
 
 def existDir(dir_path: str) -> None:
@@ -105,6 +141,7 @@ SOURCE_VIDEO_FRAME_DIR = f"{base_path}/{case_name}/tmp_data/{case_name}/{camera_
 """
 Step 1: Environment settings and model initialization for Grounding DINO and SAM 2
 """
+install_bert_head_mask_compat()
 # build grounding dino model from local path
 grounding_model = load_model(
     model_config_path=GROUNDING_DINO_CONFIG,

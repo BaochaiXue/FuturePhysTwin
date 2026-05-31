@@ -51,6 +51,7 @@ shape_prior_max_dist = args.shape_prior_max_dist
 shape_prior_sampling_backend = args.shape_prior_sampling_backend
 target_surface_points = args.target_surface_points
 target_interior_points = args.target_interior_points
+MVSAM3D_MAX_DIST_CAP = 0.035
 
 
 def filter_points_by_nn_distance(
@@ -68,6 +69,12 @@ def resolve_sampling_backend() -> str:
         return shape_prior_sampling_backend
     marker = Path(base_path) / case_name / "shape" / "mvsam3d"
     return "mvsam3d" if marker.exists() else "legacy"
+
+
+def effective_mvsam3d_max_dist() -> float:
+    if shape_prior_max_dist <= 0:
+        return shape_prior_max_dist
+    return min(shape_prior_max_dist, MVSAM3D_MAX_DIST_CAP)
 
 
 def point_grid_index(
@@ -153,13 +160,14 @@ def sample_mvsam3d_prior_points(
     np.random.seed(42)
     min_bound = np.min(reference_points, axis=0)
     prior_grid_size = max(volume_sample_size * 0.4, 1e-4)
+    max_dist = effective_mvsam3d_max_dist()
 
     surface_candidates = []
     surface_points = np.zeros((0, 3), dtype=np.float32)
     for count in [max(num_surface_points, 4096), 10000, 50000, 200000]:
         sampled, _ = trimesh.sample.sample_surface(trimesh_mesh, count)
         sampled = filter_points_by_nn_distance(
-            sampled, reference_points, shape_prior_max_dist
+            sampled, reference_points, max_dist
         )
         sampled = sort_by_reference_distance(sampled, reference_points)
         surface_candidates.append(sampled)
@@ -172,7 +180,7 @@ def sample_mvsam3d_prior_points(
         if len(surface_points) >= target_surface_points:
             break
     if len(surface_points) < target_surface_points:
-        for max_dist in [shape_prior_max_dist * 1.5, 0]:
+        for _ in range(2):
             sampled, _ = trimesh.sample.sample_surface(trimesh_mesh, 200000)
             if max_dist > 0:
                 sampled = filter_points_by_nn_distance(sampled, reference_points, max_dist)
@@ -195,7 +203,7 @@ def sample_mvsam3d_prior_points(
         except Exception:
             sampled = np.zeros((0, 3), dtype=np.float32)
         sampled = filter_points_by_nn_distance(
-            sampled, reference_points, shape_prior_max_dist
+            sampled, reference_points, max_dist
         )
         sampled = sort_by_reference_distance(sampled, reference_points)
         interior_candidates.append(sampled)
@@ -210,31 +218,11 @@ def sample_mvsam3d_prior_points(
 
     if len(interior_points) < target_interior_points:
         fallback = voxel_interior_candidates(
-            trimesh_mesh, reference_points, shape_prior_max_dist
+            trimesh_mesh, reference_points, max_dist
         )
         if fallback.size:
             interior_points = dedupe_points(
                 np.vstack([*interior_candidates, fallback]),
-                min_bound,
-                limit=target_interior_points,
-                grid_size=prior_grid_size,
-            )
-    if len(interior_points) < target_interior_points:
-        relaxed = voxel_interior_candidates(
-            trimesh_mesh, reference_points, shape_prior_max_dist * 1.5
-        )
-        if relaxed.size:
-            interior_points = dedupe_points(
-                np.vstack([*interior_candidates, interior_points, relaxed]),
-                min_bound,
-                limit=target_interior_points,
-                grid_size=prior_grid_size,
-            )
-    if len(interior_points) < target_interior_points:
-        unfiltered = voxel_interior_candidates(trimesh_mesh, reference_points, 0)
-        if unfiltered.size:
-            interior_points = dedupe_points(
-                np.vstack([*interior_candidates, interior_points, unfiltered]),
                 min_bound,
                 limit=target_interior_points,
                 grid_size=prior_grid_size,

@@ -14,13 +14,52 @@ os.environ["SPCONV_ALGO"] = "native"  # Can be 'native' or 'auto', default is 'a
 
 import sys
 
-sys.path.append("sam-3d-objects/notebook")
-from inference import Inference  # type: ignore
-from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils
-
-
-DEFAULT_CONFIG = Path("sam-3d-objects/checkpoints/hf/pipeline.yaml")
+DEFAULT_SAM3D_ROOT_CANDIDATES = [
+    Path(os.environ[key]).expanduser()
+    for key in ("SAM3D_ROOT", "MVSAM3D_ROOT")
+    if os.environ.get(key)
+]
+DEFAULT_SAM3D_ROOT_CANDIDATES += [
+    Path("sam-3d-objects"),
+    Path("/home/xinjie/external/MV-SAM3D"),
+]
 DEFAULT_SEED = 42
+
+
+def resolve_sam3d_root(value: str | None = None) -> Path:
+    candidates = [Path(value).expanduser()] if value else []
+    candidates.extend(DEFAULT_SAM3D_ROOT_CANDIDATES)
+    for candidate in candidates:
+        root = candidate.resolve()
+        if (root / "notebook" / "inference.py").exists() and (
+            root / "sam3d_objects"
+        ).exists():
+            return root
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "SAM3D root not found. Set SAM3D_ROOT or MVSAM3D_ROOT to a checkout "
+        f"containing notebook/inference.py and sam3d_objects/. Searched: {searched}"
+    )
+
+
+def default_config_for_root(root: Path) -> Path:
+    for candidate in [
+        root / "checkpoints" / "hf" / "pipeline.yaml",
+        root / "checkpoints" / "hf" / "checkpoints" / "pipeline.yaml",
+    ]:
+        if candidate.exists():
+            return candidate
+    return root / "checkpoints" / "hf" / "pipeline.yaml"
+
+
+def load_inference_class(root: Path):
+    for path in [root, root / "notebook"]:
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+    from inference import Inference  # type: ignore
+
+    return Inference
 
 
 def ensure_dir(path: Path) -> None:
@@ -106,8 +145,20 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=str,
-        default=str(DEFAULT_CONFIG),
-        help="SAM3D pipeline config (default: sam-3d-objects/checkpoints/hf/pipeline.yaml)",
+        default=None,
+        help=(
+            "SAM3D pipeline config. Defaults to <SAM3D_ROOT>/checkpoints/hf/pipeline.yaml "
+            "or <SAM3D_ROOT>/checkpoints/hf/checkpoints/pipeline.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--sam3d_root",
+        type=str,
+        default=None,
+        help=(
+            "External SAM3D checkout. Defaults to SAM3D_ROOT, then MVSAM3D_ROOT, "
+            "then local known checkouts."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -116,6 +167,9 @@ def main() -> None:
         help="Random seed for SAM3D inference (default: 42)",
     )
     args = parser.parse_args()
+
+    sam3d_root = resolve_sam3d_root(args.sam3d_root)
+    Inference = load_inference_class(sam3d_root)
 
     img_path = Path(args.img_path)
     output_dir = Path(args.output_dir)
@@ -132,7 +186,7 @@ def main() -> None:
     # SAM3D expects numpy arrays; convert RGB PIL image to uint8 ndarray.
     image_rgb = np.array(final_im.convert("RGB"), dtype=np.uint8)
 
-    config_path = Path(args.config)
+    config_path = Path(args.config).expanduser() if args.config else default_config_for_root(sam3d_root)
     if not config_path.exists():
         raise FileNotFoundError(f"SAM3D config not found: {config_path}")
 
