@@ -346,6 +346,7 @@ If you are interested in collaborating or extending this work for your research,
 * **[PhysWorld: From Real Videos to World Models of Deformable Objects via Physics-Aware Demonstration Synthesis](https://arxiv.org/abs/2510.21447)**
 * **[NeuSpring: Neural Spring Fields for Reconstruction and Simulation of Deformable Objects from Videos](https://arxiv.org/abs/2511.08310)**
 * **[Cool PhysTwin Data Collection Pipeline using SO-101](https://github.com/TabithaKO/PhysTwin)**
+* **[DeformMaster: An Interactive Physics-Neural World Model for Deformable Objects from Videos](https://arxiv.org/abs/2605.09586)**
 * ...
 
 ### Citation
