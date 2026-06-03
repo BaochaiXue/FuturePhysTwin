@@ -20,7 +20,7 @@ from utils.align_util import (
 from match_pairs import image_pair_matching
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from scipy.spatial import KDTree
+from scipy.spatial import KDTree, cKDTree
 import hashlib
 from pathlib import Path
 
@@ -39,7 +39,14 @@ parser.add_argument(
     default=False,
     help="Recompute SuperGlue matching even if a cached best_match.pkl exists.",
 )
+parser.add_argument(
+    "--skip_visualization",
+    action="store_true",
+    default=False,
+    help="Skip diagnostic plots/videos while still writing the aligned mesh.",
+)
 args = parser.parse_args()
+VIS = not args.skip_visualization
 
 base_path = args.base_path
 case_name = args.case_name
@@ -207,49 +214,49 @@ def get_matching_ray_registration(
     vertices_cam = vertices_cam[:, :3]
     # shape: vertices_cam (V, 3).
 
-    obs_kd = KDTree(obs_points_cam)
+    obs_kd = cKDTree(obs_points_cam)
 
     new_indices = []
     new_targets = []
     # trimesh used to do the ray-casting test
     mesh.vertices = np.asarray(vertices_cam)[trimesh_indices]
-    # shape: mesh.vertices (Fitted_V, 3), indexed back to trimesh vertex order.
-    for index, vertex in enumerate(vertices_cam):
-        ray_origins = np.array([[0, 0, 0]])
-        # shape: ray_origins (1, 3).
-        ray_direction = vertex
-        ray_direction = ray_direction / np.linalg.norm(ray_direction)
-        ray_directions = np.array([ray_direction])
-        # shape: ray_directions (1, 3).
-        locations, _, _ = mesh.ray.intersects_location(
-            ray_origins=ray_origins, ray_directions=ray_directions, multiple_hits=False
+    vertex_norms = np.linalg.norm(vertices_cam, axis=1)
+    valid_vertex_indices = np.where(vertex_norms > 1e-8)[0]
+    if valid_vertex_indices.size == 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0, 3), dtype=np.float64)
+
+    ray_vertices = vertices_cam[valid_vertex_indices]
+    ray_origins = np.zeros_like(ray_vertices)
+    ray_directions = ray_vertices / vertex_norms[valid_vertex_indices, None]
+    occluded = np.zeros(valid_vertex_indices.shape[0], dtype=bool)
+    try:
+        locations, index_ray, _ = mesh.ray.intersects_location(
+            ray_origins=ray_origins,
+            ray_directions=ray_directions,
+            multiple_hits=False,
         )
+    except Exception:
+        locations, index_ray = np.zeros((0, 3)), np.zeros((0,), dtype=np.int64)
+    if len(locations) > 0:
+        intersection_distances = np.linalg.norm(locations, axis=1)
+        vertex_distances = vertex_norms[valid_vertex_indices][index_ray]
+        occluded[index_ray] = intersection_distances < vertex_distances - 1e-4
 
-        ignore_flag = False
-
-        if len(locations) > 0:
-            first_intersection = locations[0]
-            vertex_distance = np.linalg.norm(vertex)
-            intersection_distance = np.linalg.norm(first_intersection)
-            if intersection_distance < vertex_distance - 1e-4:
-                # If the intersection point is not the vertex, it means the vertex is not visible from the camera viewpoint
-                ignore_flag = True
-
-        if ignore_flag:
+    visible_vertex_indices = valid_vertex_indices[~occluded]
+    visible_vertices = vertices_cam[visible_vertex_indices]
+    nearby_indices = obs_kd.query_ball_point(visible_vertices, 0.02)
+    for index, vertex, indices in zip(
+        visible_vertex_indices, visible_vertices, nearby_indices
+    ):
+        if len(indices) == 0:
             continue
-        else:
-            # Select the closest point to the ray of the observation points as the matching point
-            indices = obs_kd.query_ball_point(vertex, 0.02)
-            line_distances = line_point_distance(vertex, obs_points_cam[indices])
-            # Get the closest point
-            if len(line_distances) > 0:
-                closest_index = np.argmin(line_distances)
-                target = np.dot(
-                    c2w, np.hstack((obs_points_cam[indices][closest_index], 1))
-                )
-                # shape: target (4,), homogeneous world point.
-                new_indices.append(index)
-                new_targets.append(target[:3])
+        line_distances = line_point_distance(vertex, obs_points_cam[indices])
+        if len(line_distances) == 0:
+            continue
+        closest_index = np.argmin(line_distances)
+        target = np.dot(c2w, np.hstack((obs_points_cam[indices][closest_index], 1)))
+        new_indices.append(index)
+        new_targets.append(target[:3])
 
     new_indices = np.asarray(new_indices)
     new_targets = np.asarray(new_targets)
@@ -270,8 +277,11 @@ def deform_ARAP_ray_registration(
 ):
     final_indices = []
     final_targets = []
+    final_index_to_position = {}
     for index, target in zip(mesh_points_indices, matching_points):
-        if index not in final_indices:
+        index = int(index)
+        if index not in final_index_to_position:
+            final_index_to_position[index] = len(final_indices)
             final_indices.append(index)
             final_targets.append(target)
 
@@ -280,7 +290,9 @@ def deform_ARAP_ray_registration(
             deform_kp_mesh_world, obs_points_world, mesh, trimesh_indices, c2w, w2c
         )
         for index, target in zip(new_indices, new_targets):
-            if index not in final_indices:
+            index = int(index)
+            if index not in final_index_to_position:
+                final_index_to_position[index] = len(final_indices)
                 final_indices.append(index)
                 final_targets.append(target)
 
@@ -288,17 +300,20 @@ def deform_ARAP_ray_registration(
     indices = np.where(np.asarray(deform_kp_mesh_world.vertices)[:, 2] > 0)[0]
     # shape: indices (K_ground,), vertices above the table plane.
     for index in indices:
-        if index not in final_indices:
+        index = int(index)
+        if index not in final_index_to_position:
+            final_index_to_position[index] = len(final_indices)
             final_indices.append(index)
             target = np.asarray(deform_kp_mesh_world.vertices)[index].copy()
             # shape: target (3,).
             target[2] = 0
             final_targets.append(target)
         else:
-            target = final_targets[final_indices.index(index)]
+            target_position = final_index_to_position[index]
+            target = final_targets[target_position]
             if target[2] > 0:
                 target[2] = 0
-                final_targets[final_indices.index(index)] = target
+                final_targets[target_position] = target
 
     try:
         final_mesh_world = deform_kp_mesh_world.deform_as_rigid_as_possible(

@@ -36,8 +36,32 @@ parser.add_argument(
     choices=["legacy", "mvsam3d", "auto"],
     default="auto",
 )
+parser.add_argument(
+    "--ground-policy",
+    "--ground_policy",
+    choices=["preserve", "clamp-positive-z"],
+    default="preserve",
+    help=(
+        "How to handle object point z values before volume sampling. "
+        "preserve keeps the input coordinate frame unchanged; clamp-positive-z "
+        "keeps legacy behavior by clamping z values above --ground-z to --ground-z."
+    ),
+)
+parser.add_argument(
+    "--ground-z",
+    "--ground_z",
+    type=float,
+    default=0.0,
+    help="Ground plane z used only by --ground-policy clamp-positive-z.",
+)
 parser.add_argument("--target_surface_points", type=int, default=700)
 parser.add_argument("--target_interior_points", type=int, default=1000)
+parser.add_argument(
+    "--skip_visualization",
+    action="store_true",
+    default=False,
+    help="Skip final turntable videos while still writing final_data.pkl.",
+)
 args = parser.parse_args()
 
 base_path = args.base_path
@@ -49,8 +73,11 @@ num_surface_points = args.num_surface_points
 volume_sample_size = args.volume_sample_size
 shape_prior_max_dist = args.shape_prior_max_dist
 shape_prior_sampling_backend = args.shape_prior_sampling_backend
+ground_policy = args.ground_policy
+ground_z = args.ground_z
 target_surface_points = args.target_surface_points
 target_interior_points = args.target_interior_points
+skip_visualization = args.skip_visualization
 MVSAM3D_MAX_DIST_CAP = 0.035
 
 
@@ -75,6 +102,17 @@ def effective_mvsam3d_max_dist() -> float:
     if shape_prior_max_dist <= 0:
         return shape_prior_max_dist
     return min(shape_prior_max_dist, MVSAM3D_MAX_DIST_CAP)
+
+
+def apply_ground_policy(points: np.ndarray) -> np.ndarray:
+    """Apply the configured ground policy without changing coordinate frames by default."""
+    if ground_policy == "preserve":
+        return points
+    if ground_policy == "clamp-positive-z":
+        points = np.asarray(points).copy()
+        points[points[..., 2] > ground_z, 2] = ground_z
+        return points
+    raise ValueError(f"Unsupported ground policy: {ground_policy}")
 
 
 def point_grid_index(
@@ -252,8 +290,7 @@ def process_unique_points(track_data):
     object_visibilities = object_visibilities[:, unique_idx]
     object_motions_valid = object_motions_valid[:, unique_idx]
 
-    # Make sure all points are above the ground
-    object_points[object_points[..., 2] > 0, 2] = 0
+    object_points = apply_ground_policy(object_points)
 
     if SHAPE_PRIOR:
         shape_mesh_path = f"{base_path}/{case_name}/shape/matching/final_mesh.glb"
@@ -329,37 +366,38 @@ def process_unique_points(track_data):
     else:
         all_points = object_points[0][index]
 
-    # Render the final pcd with interior filling as a turntable video
-    all_pcd = o3d.geometry.PointCloud()
-    all_pcd.points = o3d.utility.Vector3dVector(all_points)
-    coorindate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+    if not skip_visualization:
+        # Render the final pcd with interior filling as a turntable video
+        all_pcd = o3d.geometry.PointCloud()
+        all_pcd.points = o3d.utility.Vector3dVector(all_points)
+        coorindate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
 
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False)
-    dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-    height, width, _ = dummy_frame.shape
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv2.VideoWriter(
-        f"{base_path}/{case_name}/final_pcd.mp4", fourcc, 30, (width, height)
-    )
-    if not video_writer.isOpened():
-        raise RuntimeError(
-            f"Failed to open VideoWriter for {base_path}/{case_name}/final_pcd.mp4"
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(visible=False)
+        dummy_frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+        height, width, _ = dummy_frame.shape
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(
+            f"{base_path}/{case_name}/final_pcd.mp4", fourcc, 30, (width, height)
         )
+        if not video_writer.isOpened():
+            raise RuntimeError(
+                f"Failed to open VideoWriter for {base_path}/{case_name}/final_pcd.mp4"
+            )
 
-    vis.add_geometry(all_pcd)
-    # vis.add_geometry(coorindate)
-    view_control = vis.get_view_control()
-    for j in range(360):
-        view_control.rotate(10, 0)
-        vis.poll_events()
-        vis.update_renderer()
-        frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
-        frame = (frame * 255).astype(np.uint8)
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        video_writer.write(frame)
-    video_writer.release()
-    vis.destroy_window()
+        vis.add_geometry(all_pcd)
+        # vis.add_geometry(coorindate)
+        view_control = vis.get_view_control()
+        for j in range(360):
+            view_control.rotate(10, 0)
+            vis.poll_events()
+            vis.update_renderer()
+            frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
+            frame = (frame * 255).astype(np.uint8)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            video_writer.write(frame)
+        video_writer.release()
+        vis.destroy_window()
 
     track_data.pop("object_points")
     track_data.pop("object_colors")
@@ -375,6 +413,8 @@ def process_unique_points(track_data):
     else:
         track_data["surface_points"] = np.zeros((0, 3))
         track_data["interior_points"] = np.zeros((0, 3))
+    track_data["shape_prior_ground_policy"] = ground_policy
+    track_data["shape_prior_ground_z"] = float(ground_z)
 
     return track_data
 
@@ -466,4 +506,5 @@ if __name__ == "__main__":
     with open(f"{base_path}/{case_name}/final_data.pkl", "wb") as f:
         pickle.dump(track_data, f)
 
-    visualize_track(track_data)
+    if not skip_visualization:
+        visualize_track(track_data)

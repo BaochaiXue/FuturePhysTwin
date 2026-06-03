@@ -166,6 +166,14 @@ def main() -> None:
         default=DEFAULT_SEED,
         help="Random seed for SAM3D inference (default: 42)",
     )
+    parser.add_argument(
+        "--skip_visualization",
+        action="store_true",
+        help=(
+            "Skip optional visualization.mp4 generation. Mesh/gaussian export "
+            "and all shape-prior data products are still produced."
+        ),
+    )
     args = parser.parse_args()
 
     sam3d_root = resolve_sam3d_root(args.sam3d_root)
@@ -282,7 +290,10 @@ def main() -> None:
 
     if gaussian is not None:
         gaussian.save_ply(output_dir / "object.ply")
-        save_visualization(gaussian, mesh_for_save, output_dir, mesh_path)
+        if args.skip_visualization:
+            print("[info] skipping visualization.mp4 generation")
+        else:
+            save_visualization(gaussian, mesh_for_save, output_dir, mesh_path)
     else:
         print(
             "[warn] Gaussian output missing; skipping object.ply and visualization.mp4"
