@@ -427,16 +427,19 @@ class InvPhyTrainerWarp:
             if i % cfg.vis_interval == 0 or i == cfg.iterations - 1:
                 video_path = f"{cfg.base_dir}/train/sim_iter{i}.mp4"
                 self.visualize_sim(save_only=True, video_path=video_path)
-                wandb.log(
-                    {
-                        "video": wandb.Video(
-                            video_path,
-                            format="mp4",
-                            fps=cfg.FPS,
-                        ),
-                    },
-                    step=i,
-                )
+                if os.path.exists(video_path):
+                    wandb.log(
+                        {
+                            "video": wandb.Video(
+                                video_path,
+                                format="mp4",
+                                fps=cfg.FPS,
+                            ),
+                        },
+                        step=i,
+                    )
+                else:
+                    wandb.log({"video_missing": True}, step=i)
                 # Save learned parameters; topology is exported via standalone tool.
                 cur_model = {
                     "epoch": i,
