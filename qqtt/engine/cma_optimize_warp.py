@@ -9,6 +9,7 @@ import warp as wp
 import cma
 import pickle
 import os
+import gc
 
 
 class OptimizerCMA:
@@ -425,4 +426,17 @@ class OptimizerCMA:
                 save_path=video_path,
             )
 
-        return total_loss
+        result = float(total_loss)
+        self.simulator = None
+        self.init_vertices = None
+        self.init_springs = None
+        self.init_rest_lengths = None
+        self.init_masses = None
+        try:
+            wp.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result

@@ -1,4 +1,5 @@
 from .misc import singleton
+import math
 import yaml
 
 
@@ -72,6 +73,20 @@ class Config:
         with open(file_path, "r") as file:
             config_dict = yaml.safe_load(file)
         self.update_from_dict(config_dict)
+
+    def apply_case_timing_from_metadata(self, metadata):
+        case_fps = float(metadata.get("fps", self.FPS))
+        if not math.isfinite(case_fps) or case_fps <= 0.0:
+            raise ValueError(f"metadata fps must be positive, got {case_fps}")
+
+        base_dt = float(self.dt)
+        if not math.isfinite(base_dt) or base_dt <= 0.0:
+            raise ValueError(f"cfg.dt must be positive before applying case timing, got {base_dt}")
+
+        frame_dt = 1.0 / case_fps
+        self.num_substeps = max(1, int(math.ceil(frame_dt / base_dt)))
+        self.dt = frame_dt / self.num_substeps
+        self.FPS = case_fps
 
     def set_optimal_params(self, optimal_params):
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")

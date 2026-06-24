@@ -57,6 +57,7 @@ if __name__ == "__main__":
         data = json.load(f)
     cfg.intrinsics = np.array(data["intrinsics"])
     cfg.WH = data["WH"]
+    cfg.apply_case_timing_from_metadata(data)
     cfg.overlay_path = f"{base_path}/{case_name}/color"
 
     logger.set_log_file(path=base_dir, name="optimize_cma_log")
